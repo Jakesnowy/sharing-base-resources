@@ -1,0 +1,99 @@
+name: Build Mod
+
+# 云端编译 ModIntegratedStorageCpp —— 本地零依赖，push 即出 dll。
+# 设计要点：
+#   - RE-UE4SS 固定在 commit f12f0bed（与开发环境一致，SDK/偏移稳定）
+#   - 缓存 xmake 包 + RE-UE4SS 编译中间产物 → 二次构建只重编 dllmain.cpp（秒级）
+#   - patternsleuth 等 Rust 依赖编译一次后随缓存复用，不再触碰 → 不会再编坏
+
+on:
+  push:
+    branches: [ main, master ]
+    paths:
+      - 'src/**'
+      - '.github/workflows/build.yml'
+  workflow_dispatch:        # 手动触发：Actions 页面 → Run workflow
+
+env:
+  RE_UE4SS_COMMIT: f12f0bedc34a0e4fdb05f36953686a13dd10641b
+  MOD_NAME: ModIntegratedStorageCpp
+  CONFIG: Game__Shipping__Win64
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout mod source
+        uses: actions/checkout@v4
+
+      - name: Setup xmake
+        uses: xmake-io/github-action-setup-xmake@v1
+        with:
+          xmake-version: latest
+
+      - name: Cache xmake packages (imgui/polyhook/patternsleuth ...)
+        uses: actions/cache@v4
+        with:
+          path: ~\AppData\Local\.xmake
+          key: xmake-pkgs-reue4ss-${{ env.RE_UE4SS_COMMIT }}
+
+      - name: Cache RE-UE4SS build tree (Intermediates)
+        uses: actions/cache@v4
+        with:
+          path: RE-UE4SS\Intermediates
+          key: reue4ss-build-${{ env.RE_UE4SS_COMMIT }}
+
+      - name: Clone RE-UE4SS (pinned commit, with submodules)
+        shell: pwsh
+        run: |
+          git clone https://github.com/UE4SS-RE/RE-UE4SS.git RE-UE4SS
+          Push-Location RE-UE4SS
+          git checkout $env:RE_UE4SS_COMMIT
+          git submodule update --init --recursive
+          Pop-Location
+
+      - name: Inject mod into RE-UE4SS tree
+        shell: pwsh
+        run: |
+          $mod = "RE-UE4SS\cppmods\$env:MOD_NAME\src"
+          New-Item -ItemType Directory -Force -Path $mod | Out-Null
+          Copy-Item src\xmake.lua "RE-UE4SS\cppmods\$env:MOD_NAME\xmake.lua" -Force
+          Copy-Item src\dllmain.cpp "RE-UE4SS\cppmods\$env:MOD_NAME\src\dllmain.cpp" -Force
+          Write-Host "mod injected into RE-UE4SS\cppmods\$env:MOD_NAME"
+
+      - name: Configure & Build
+        shell: pwsh
+        run: |
+          Push-Location RE-UE4SS
+          xmake f -m $env:CONFIG -y
+          xmake build -y $env:MOD_NAME
+          $code = $LASTEXITCODE
+          Pop-Location
+          if ($code -ne 0) { throw "xmake build failed (exit $code)" }
+
+      - name: Assemble installable mod
+        shell: pwsh
+        run: |
+          $dll = Get-ChildItem -Path RE-UE4SS\Intermediates -Recurse -Filter "$env:MOD_NAME.dll" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $dll) { throw "compiled $env:MOD_NAME.dll not found under Intermediates" }
+          Write-Host "found dll: $($dll.FullName)"
+          $dist = "dist\$env:MOD_NAME"
+          New-Item -ItemType Directory -Force -Path "$dist\dlls" | Out-Null
+          Copy-Item $dll.FullName "$dist\dlls\main.dll" -Force
+          New-Item -ItemType File -Force -Path "$dist\enabled.txt" | Out-Null
+          New-Item -ItemType File -Force -Path "$dist\config.txt" | Out-Null
+          if (Test-Path "$env:MOD_NAME.zip") { Remove-Item "$env:MOD_NAME.zip" -Force }
+          Compress-Archive -Path "$dist\*" -DestinationPath "$env:MOD_NAME.zip" -Force
+          Write-Host "assembled $dist + $env:MOD_NAME.zip"
+
+      - name: Upload mod folder
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.MOD_NAME }}
+          path: dist\${{ env.MOD_NAME }}
+
+      - name: Upload zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.MOD_NAME }}.zip
+          path: ${{ env.MOD_NAME }}.zip
