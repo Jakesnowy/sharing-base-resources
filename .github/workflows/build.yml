@@ -42,15 +42,6 @@ jobs:
       - name: Update xmake repository
         run: xmake repo --update
 
-      - name: Retrieve dependencies hash
-        id: dep_hash
-        shell: pwsh
-        run: |
-          Push-Location RE-UE4SS 2>$null
-          # hash will be computed after clone; placeholder for now
-          echo "hash=nocache-first" >> $env:GITHUB_OUTPUT
-          Pop-Location 2>$null
-
       - name: Cache xmake packages
         uses: actions/cache@v4
         with:
