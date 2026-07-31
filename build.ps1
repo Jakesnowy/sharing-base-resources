@@ -29,7 +29,7 @@
     设为 "" 禁用代理。备选: https://ghfast.top/  https://ghproxy.net/
 
 .PARAMETER Configuration
-    release(默认) 或 debug。
+    RE-UE4SS 编译模式，默认 Game__Shipping__Win64（发布版）。开发用 Game__Dev__Win64。
 
 .PARAMETER NoBuild
     与 -Bootstrap 配合：只准备环境，不编译。
@@ -49,7 +49,7 @@
 [CmdletBinding()]
 param(
     [string]$UE4SSRoot     = $env:UE4SS_ROOT,
-    [string]$Configuration = "release",
+    [string]$Configuration = "Game__Shipping__Win64",
     [switch]$Bootstrap,
     [string]$GitHubProxy   = "https://gh-proxy.com/",
     [switch]$NoBuild,
@@ -262,19 +262,22 @@ Write-Ok "编译完成"
 #  3) 定位产物 dll
 # ----------------------------------------------------------------------------
 Write-Step "定位编译产物..."
-$buildDir = Join-Path $UE4SSRoot "build"
-$candidates = @(
-    (Join-Path $buildDir "windows\x64\$Configuration\$ModName.dll"),
-    (Join-Path $buildDir "windows\$Configuration\$ModName.dll"),
-    (Join-Path $buildDir "$Configuration\$ModName.dll")
-)
+# RE-UE4SS 的 buildir 是 Intermediates/，不是 build/；两个都搜，且兜底递归搜
+$searchRoots = @((Join-Path $UE4SSRoot "Intermediates"), (Join-Path $UE4SSRoot "build"))
 $built = $null
-foreach ($c in $candidates) { if (Test-Path -LiteralPath $c) { $built = $c; break } }
-if (-not $built -and (Test-Path -LiteralPath $buildDir)) {
-    $found = Get-ChildItem -Path $buildDir -Recurse -Filter "$ModName.dll" -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($found) { $built = $found.FullName }
+foreach ($root in $searchRoots) {
+    if (-not (Test-Path -LiteralPath $root)) { continue }
+    $cands = @(
+        (Join-Path $root "windows\x64\$Configuration\$ModName.dll"),
+        (Join-Path $root "windows\$Configuration\$ModName.dll"),
+        (Join-Path $root "$Configuration\$ModName.dll")
+    )
+    foreach ($c in $cands) { if (Test-Path -LiteralPath $c) { $built = $c; break } }
+    if ($built) { break }
+    $found = Get-ChildItem -Path $root -Recurse -Filter "$ModName.dll" -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($found) { $built = $found.FullName; break }
 }
-if (-not $built) { Die "编译成功但在 $buildDir 下找不到 $ModName.dll，请手动搜索。" }
+if (-not $built) { Die "编译成功但在 $UE4SSRoot 下找不到 $ModName.dll（搜了 Intermediates/ 和 build/），请手动搜索。" }
 Write-Ok "找到 $built"
 
 # ----------------------------------------------------------------------------
