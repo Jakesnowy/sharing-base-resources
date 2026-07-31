@@ -35,13 +35,13 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~\AppData\Local\.xmake
-          key: xmake-pkgs-reue4ss-${{ env.RE_UE4SS_COMMIT }}
+          key: xmake-pkgs-reue4ss-${{ env.RE_UE4SS_COMMIT }}-vs2022
 
       - name: Cache RE-UE4SS build tree (Intermediates)
         uses: actions/cache@v4
         with:
           path: RE-UE4SS\Intermediates
-          key: reue4ss-build-${{ env.RE_UE4SS_COMMIT }}
+          key: reue4ss-build-${{ env.RE_UE4SS_COMMIT }}-vs2022
 
       - name: Clone RE-UE4SS (pinned commit, with submodules)
         shell: pwsh
@@ -73,6 +73,16 @@ jobs:
           $code = $LASTEXITCODE
           Pop-Location
           if ($code -ne 0) { throw "xmake build failed (exit $code)" }
+
+      - name: Dump package install logs on failure
+        if: failure()
+        shell: pwsh
+        run: |
+          $logs = Get-ChildItem -Path "$env:LOCALAPPDATA\.xmake\cache\packages" -Recurse -Filter "install.txt" -ErrorAction SilentlyContinue
+          foreach ($l in $logs) {
+            Write-Host "========== $($l.FullName) =========="
+            Get-Content $l.FullName | Select-Object -Last 40
+          }
 
       - name: Assemble installable mod
         shell: pwsh
