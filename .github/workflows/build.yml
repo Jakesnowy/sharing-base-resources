@@ -21,7 +21,7 @@ env:
 
 jobs:
   build:
-    runs-on: windows-latest
+    runs-on: windows-2022  # pin VS 2022 toolset — VS 2026 breaks raw_pdb/ImGuiTextEdit package builds
     steps:
       - name: Checkout mod source
         uses: actions/checkout@v4
