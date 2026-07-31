@@ -89,6 +89,27 @@ jobs:
           Copy-Item src\dllmain.cpp "RE-UE4SS\cppmods\$env:MOD_NAME\src\dllmain.cpp" -Force
           Write-Host "mod injected into RE-UE4SS\cppmods\$env:MOD_NAME"
 
+      - name: Patch ImGuiTextEdit for imgui v1.89 compatibility
+        shell: pwsh
+        run: |
+          # ImGuiTextEdit commit af78219 uses PushTabStop/PopTabStop (imgui 1.90+ API)
+          # but RE-UE4SS pins imgui v1.89 which lacks these. Patch them out.
+          $file = "RE-UE4SS\deps\third-repo\packages\i\imguitextedit\xmake.lua"
+          $content = Get-Content $file -Raw
+          $patch = @"
+            -- Patch: comment out PushTabStop/PopTabStop (not in imgui v1.89)
+            local te = io.readfile("TextEditor.cpp")
+            if te then
+                te = te:gsub("(ImGui::PushTabStop%b())", "// %1")
+                te = te:gsub("(ImGui::PopTabStop%b())", "// %1")
+                io.writefile("TextEditor.cpp", te)
+            end
+
+"@
+          $content = $content -replace 'on_install\(function \(package\)\n', "on_install(function (package)`n$patch"
+          Set-Content $file $content -NoNewline
+          Write-Host "patched imguitextedit xmake.lua for imgui v1.89 compatibility"
+
       - name: Configure & Build (with VS DevShell)
         shell: pwsh
         run: |
