@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     IntegratedStorage (UE4SS C++ mod) 一键安装环境 + 编译 + 打包脚本（国内网络友好）。
 
