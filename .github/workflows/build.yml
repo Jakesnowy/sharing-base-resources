@@ -1,11 +1,10 @@
 name: Build Mod
 
 # 云端编译 ModIntegratedStorageCpp —— 本地零依赖，push 即出 dll。
-# 对齐 RE-UE4SS 官方 CI (msvc_build_ue4ss.yml) 的构建方式：
-#   - xmake 2.9.3（官方锁定版本）
-#   - VS DevShell 初始化 MSVC 环境（CMake/ninja 包编译需要）
-#   - XMAKE_GLOBALDIR 指向 tool_cache 便于缓存
-#   - RE-UE4SS 固定在 commit f12f0bed
+# 对齐 RE-UE4SS 官方 CI (msvc_build_ue4ss.yml)：
+#   - 安装 VS2022 BuildTools 17.9.7（MSVC 14.39 → 工具集 v143，避免 v144 问题）
+#   - xmake 2.9.3 + VS DevShell
+#   - RE-UE4SS 固定 commit f12f0bed
 
 on:
   push:
@@ -13,7 +12,7 @@ on:
     paths:
       - 'src/**'
       - '.github/workflows/build.yml'
-  workflow_dispatch:        # 手动触发：Actions 页面 → Run workflow
+  workflow_dispatch:
 
 env:
   RE_UE4SS_COMMIT: f12f0bedc34a0e4fdb05f36953686a13dd10641b
@@ -22,7 +21,7 @@ env:
 
 jobs:
   build:
-    runs-on: windows-2022  # VS 2022 — VS 2026 breaks package builds
+    runs-on: windows-latest
     steps:
       - name: Checkout mod source
         uses: actions/checkout@v4
@@ -33,6 +32,12 @@ jobs:
       - name: Get cache key (weekly)
         id: cache_key
         run: echo "key=$(date +'%W')" >> $env:GITHUB_OUTPUT
+
+      # Install specific VS2022 BuildTools 17.9.7 → MSVC 14.39 (toolset v143).
+      # Runner's default VS (2026 or 17.14) has MSVC 14.44 (_MSC_VER 1944) which
+      # xmake/CMake mis-map to toolset v144, breaking CMake-based package builds.
+      - name: Install VS2022 BuildTools 17.9.7
+        run: choco install -y visualstudio2022buildtools --version=117.9.7.0 --params "--add Microsoft.VisualStudio.Component.VC.Tools.x86.x64 --installChannelUri https://aka.ms/vs/17/release/180911598_-255012421/channel"
 
       - name: Setup xmake
         uses: xmake-io/github-action-setup-xmake@v1
@@ -78,16 +83,13 @@ jobs:
 
       - name: Configure & Build (with VS DevShell)
         shell: pwsh
-        env:
-          CMAKE_GENERATOR_TOOLSET: v143
         run: |
-          # Initialize MSVC environment (required for CMake/ninja package builds)
-          Import-Module 'C:\Program Files\Microsoft Visual Studio\2022\Enterprise\Common7\Tools\Microsoft.VisualStudio.DevShell.dll'
-          Enter-VsDevShell -VsInstallPath 'C:\Program Files\Microsoft Visual Studio\2022\Enterprise' -DevCmdArguments '-arch=x64 -host_arch=x64' -SkipAutomaticLocation
+          # Initialize MSVC environment using the installed BuildTools 17.9.7
+          Import-Module 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\Microsoft.VisualStudio.DevShell.dll'
+          Enter-VsDevShell -VsInstallPath 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools' -DevCmdArguments '-arch=x64 -host_arch=x64' -SkipAutomaticLocation
 
           Push-Location RE-UE4SS
-          # --vs_toolset=v143: runner has VS 2022 17.14 (MSVC 19.44) which xmake mis-detects as v144; force v143
-          xmake config -p windows -a x64 -m $env:CONFIG --vs_toolset=v143 -y
+          xmake config -p windows -a x64 -m $env:CONFIG -y
           xmake build -y $env:MOD_NAME
           $code = $LASTEXITCODE
           Pop-Location
