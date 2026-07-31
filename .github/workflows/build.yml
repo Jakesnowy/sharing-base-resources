@@ -135,8 +135,17 @@ jobs:
       - name: Assemble installable mod
         shell: pwsh
         run: |
-          $dll = Get-ChildItem -Path RE-UE4SS\Intermediates -Recurse -Filter "$env:MOD_NAME.dll" -ErrorAction SilentlyContinue | Select-Object -First 1
-          if (-not $dll) { throw "compiled $env:MOD_NAME.dll not found under Intermediates" }
+          # Search broadly for the compiled DLL
+          $dll = Get-ChildItem -Path RE-UE4SS -Recurse -Filter "$env:MOD_NAME.dll" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $dll) {
+            Write-Host "DLL not found by name. Searching for all DLLs under RE-UE4SS:"
+            Get-ChildItem -Path RE-UE4SS -Recurse -Filter "*.dll" -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "  $($_.FullName)" }
+            # Also try xmake to list target output
+            Push-Location RE-UE4SS
+            xmake show -t $env:MOD_NAME 2>&1 | Select-Object -First 20
+            Pop-Location
+            throw "compiled $env:MOD_NAME.dll not found"
+          }
           Write-Host "found dll: $($dll.FullName)"
           $dist = "dist\$env:MOD_NAME"
           New-Item -ItemType Directory -Force -Path "$dist\dlls" | Out-Null
