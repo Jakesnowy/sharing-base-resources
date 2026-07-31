@@ -87,6 +87,13 @@ jobs:
           New-Item -ItemType Directory -Force -Path $mod | Out-Null
           Copy-Item src\xmake.lua "RE-UE4SS\cppmods\$env:MOD_NAME\xmake.lua" -Force
           Copy-Item src\dllmain.cpp "RE-UE4SS\cppmods\$env:MOD_NAME\src\dllmain.cpp" -Force
+          # Register mod in cppmods/xmake.lua (fresh clone won't have it)
+          $cppmodsLua = "RE-UE4SS\cppmods\xmake.lua"
+          $content = Get-Content $cppmodsLua -Raw
+          if ($content -notmatch [regex]::Escape($env:MOD_NAME)) {
+              Add-Content $cppmodsLua "includes(`"$($env:MOD_NAME)`")"
+              Write-Host "added includes($($env:MOD_NAME)) to cppmods/xmake.lua"
+          }
           Write-Host "mod injected into RE-UE4SS\cppmods\$env:MOD_NAME"
 
       - name: Patch ImGuiTextEdit for imgui v1.89 compatibility
