@@ -43,8 +43,8 @@ jobs:
         shell: pwsh
         run: |
           $commit = $env:RE_UE4SS_COMMIT
-          $key = "cmake-deps-${commit}-W$([math]::Floor([int](Get-Date -Format 'Iyyyww')))"
-          echo "key=$key" >> $env:GITHUB_OUTPUT
+          $week = Get-Date -Format 'yyyyWW'
+          echo "key=cmake-deps-${commit}-W${week}" >> $env:GITHUB_OUTPUT
 
       - name: Cache CMake dependencies
         uses: actions/cache@v4
