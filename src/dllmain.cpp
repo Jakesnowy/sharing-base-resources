@@ -128,14 +128,16 @@ static int g_isSrv  = -1;   // -1 unknown, 0 remote client, 1 authority (dedicat
 static int g_isDedi = -1;   // -1 unknown, 0 no, 1 dedicated server (informational: distinguishes dedicated vs host/SP)
 static UObject* g_palUtil = nullptr;
 static bool callUtilBool(const CharType* fnName, void* wc) {
-    if (!wc) return false;
-    if (!g_palUtil) g_palUtil = UObjectGlobals::StaticFindObject<UObject*>(nullptr, nullptr, STR("/Script/Pal.Default__PalUtility"));
-    if (!g_palUtil) return false;
-    UFunction* fn = g_palUtil->GetFunctionByNameInChain(fnName);
-    if (!fn) return false;
-    struct { UObject* WorldContext; bool Ret; uint8_t pad[7]; } p{}; p.WorldContext = (UObject*)wc;
-    g_palUtil->ProcessEvent(fn, &p);
-    return p.Ret;
+    __try {
+        if (!wc) return false;
+        if (!g_palUtil) g_palUtil = UObjectGlobals::StaticFindObject<UObject*>(nullptr, nullptr, STR("/Script/Pal.Default__PalUtility"));
+        if (!g_palUtil) return false;
+        UFunction* fn = g_palUtil->GetFunctionByNameInChain(fnName);
+        if (!fn) return false;
+        struct { UObject* WorldContext; bool Ret; uint8_t pad[7]; } p{}; p.WorldContext = (UObject*)wc;
+        g_palUtil->ProcessEvent(fn, &p);
+        return p.Ret;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 static void ensureRole(void* wc) {
     if (g_isSrv >= 0 || !wc) return;
@@ -185,6 +187,8 @@ static bool     g_awaitingReply = false;         // a trigger was sent, reply no
 static uint64_t g_lastTrigAt    = 0;             // GetTickCount64 of the last trigger we sent
 static uint64_t g_myCalls   = 0;                 // triggers WE sent (chClientTrigger) — client-side
 static uint64_t g_hookFires = 0;                 // times the dev trigger UFunction fired locally (== g_myCalls iff nothing else calls it)
+static int      g_consecMiss = 0;                // consecutive unanswered requests (channel health; 0 = last reply arrived)
+static int      g_missLogged = 0;                // suppress repeated miss-warning logs until recovery
 static UObject* g_common    = nullptr;           // cached local player's Common container
 static UObject* g_donorCont = nullptr;           // cached donor container (cont5)
 //! NOTE: the local PlayerController / PlayerInventoryData are NOT cached — a cached UObject* can dangle when
@@ -618,8 +622,6 @@ static const CharType* CH_REPLY_FN = STR("Debug_ReceiveCheatCommand_ToClient"); 
 static const uintptr_t OFF_CAMP_ID        = 0x58;    // UPalBaseCampModel.ID (FGuid) = the camp's own id (== client NowInsideBaseCampID)
 static const uintptr_t OFF_PAWN_CAMPCHECK = 0xC08;   // APalPlayerCharacter.InsideBaseCampCheckComponent
 static const uintptr_t OFF_CHK_CAMPID     = 0xC0;    // UPalInsideBaseCampCheckComponent.NowInsideBaseCampID (FGuid)
-static int g_chLog = 0;
-
 //! server: find the base camp whose OWN id (@0x58) matches the client-supplied camp GUID. No player/connection
 //! reverse-mapping — the requester told us its camp directly.
 static UObject* srvCampByIdInner(const uint8_t* campGuid16) {
@@ -670,7 +672,7 @@ static void srvBuildForCampInner(UObject* camp, std::wstring& out) {
         int64_t d = t.second; if (d <= 0) continue; if (d > 0x7fffffffLL) d = 0x7fffffffLL;
         out += t.first.ToString() + L":" + std::to_wstring(d) + L","; ++items;
     }
-    if (g_verbose && g_chLog < 200) { ++g_chLog; Output::send(STR("[ISGATE] CH build: otherCamp-conts={} items={} len={}\n"), scanned, items, (int)out.size()); }
+    if (g_verbose) Output::send(STR("[ISGATE] CH build: otherCamp-conts={} items={} len={}\n"), scanned, items, (int)out.size());
 }
 //! (a) SEH wrapper: srvBuildForCamp reads live ItemSlotArrays on every client request; a container freed mid-scan
 //! would AV on the slot read. Guard it so a fault yields an empty (sentinel-only) reply instead of crashing the
@@ -697,15 +699,15 @@ static void hkChRequest(UnrealScriptFunctionCallableContext& ctx, void*) {
     std::wstring req((const wchar_t*)pr.S.data);
     if (req.rfind(CH_REQ_SENTINEL, 0) != 0) return;              // not ours -> a real cheat command, leave it
     uint8_t guid[16];
-    if (!hexToGuid(req.substr(6), guid)) { if (g_verbose && g_chLog < 200) { ++g_chLog; Output::send(STR("[ISGATE] CH req: bad guid\n")); } return; }
+    if (!hexToGuid(req.substr(6), guid)) { if (g_verbose) Output::send(STR("[ISGATE] CH req: bad guid\n")); return; }
     UObject* camp = srvCampById(guid);
     if (!camp) { if (g_errLog < 64) { ++g_errLog; wchar_t gh[33]; hexOf(guid, gh); Output::send(STR("[ISGATE] CH req: camp not found guid={} (client camp not loaded on server / guid mismatch -> no reply)\n"), gh); } return; }
     std::wstring payload; srvBuildForCamp(camp, payload);
     UFunction* rf = ctrl->GetFunctionByNameInChain(CH_REPLY_FN);
-    if (!rf) { if (g_verbose && g_chLog < 200) { ++g_chLog; Output::send(STR("[ISGATE] CH req: no reply fn\n")); } return; }
+    if (!rf) { if (g_verbose) Output::send(STR("[ISGATE] CH req: no reply fn\n")); return; }
     struct { FString S; } rp{}; rp.S = FString(payload.c_str());
     ctrl->ProcessEvent(rf, &rp);
-    if (g_verbose && g_chLog < 200) { ++g_chLog; Output::send(STR("[ISGATE] CH reply sent len={}\n"), (int)payload.size()); }
+    if (g_verbose) Output::send(STR("[ISGATE] CH reply sent len={}\n"), (int)payload.size());
 }
 //! client receiver: hooked on Debug_ReceiveCheatCommand_ToClient. If the string carries our sentinel, parse it
 //! into g_pool; otherwise leave it alone. Server's own local echo -> !isClient() guard.
@@ -717,6 +719,8 @@ static void hkChReply(UnrealScriptFunctionCallableContext& ctx, void*) {
     std::wstring str((const wchar_t*)pr.S.data);
     if (str.rfind(CH_SENTINEL, 0) != 0) return;                  // not ours -> a genuine cheat reply, ignore
     g_awaitingReply = false;                                     // our reply arrived -> release the in-flight lock
+    if (g_consecMiss > 0 && g_missLogged > 0) Output::send(STR("[ISGATE] CH channel recovered after {} consecutive misses\n"), g_consecMiss);
+    g_consecMiss = 0; g_missLogged = 0;                          // channel healthy
     std::vector<std::pair<FName, int32_t>> np; int items = 0;
     size_t i = 4;                                                // skip "IS1|"
     while (i < str.size()) {                                     // parse "name:cnt,name:cnt,"
@@ -733,7 +737,7 @@ static void hkChReply(UnrealScriptFunctionCallableContext& ctx, void*) {
     g_pool = std::move(np);
     g_poolDirty = true;   // re-mint on the next detour tick (needs g_lastWc, set by the detour)
     g_lastFetchOk = GetTickCount64();   // A4: mark a successful fetch for the on_update self-heal refresh
-    if (g_verbose && g_chLog < 200) { ++g_chLog; Output::send(STR("[ISGATE] CH-RECV len={} pool={} Wood={}\n"), (int)str.size(), items, poolGet(FName(STR("Wood")))); }
+    if (g_verbose) Output::send(STR("[ISGATE] CH-RECV len={} pool={} Wood={}\n"), (int)str.size(), items, poolGet(FName(STR("Wood"))));
 }
 //! PURE-READ local in-camp test (factored from chClientTrigger's gate). Resolves the local pawn via the
 //! PlayerController's K2_GetPawn, then reads NowInsideBaseCampID's HIGH 8 bytes off the check component
@@ -749,15 +753,17 @@ static bool clientInCamp() {
     uint64_t now = GetTickCount64();
     if (s_last != 0 && now - s_last < 500) return s_cached;     // serve cache between probes (C2: 300->500ms; enter/exit isn't per-frame)
     s_last = now;
-    UObject* ctrl = UObjectGlobals::FindFirstOf(STR("PalPlayerController")); if (!ctrl) return (s_cached = false);
-    UFunction* getPawn = ctrl->GetFunctionByNameInChain(STR("K2_GetPawn")); if (!getPawn) return (s_cached = false);
-    struct { UObject* Ret; } pp{}; ctrl->ProcessEvent(getPawn, &pp);
-    UObject* pawn = pp.Ret; if (!pawn) return (s_cached = false);
-    UObject* chk = *(UObject**)((uint8_t*)pawn + OFF_PAWN_CAMPCHECK); if (!chk) return (s_cached = false);
-    const uint8_t* campGuid = (const uint8_t*)chk + OFF_CHK_CAMPID;
-    uint32_t gHiA = *(const uint32_t*)(campGuid + 0);
-    uint32_t gHiB = *(const uint32_t*)(campGuid + 4);
-    return (s_cached = !(gHiA == 0 && gHiB == 0));
+    __try {
+        UObject* ctrl = UObjectGlobals::FindFirstOf(STR("PalPlayerController")); if (!ctrl) return (s_cached = false);
+        UFunction* getPawn = ctrl->GetFunctionByNameInChain(STR("K2_GetPawn")); if (!getPawn) return (s_cached = false);
+        struct { UObject* Ret; } pp{}; ctrl->ProcessEvent(getPawn, &pp);
+        UObject* pawn = pp.Ret; if (!pawn) return (s_cached = false);
+        UObject* chk = *(UObject**)((uint8_t*)pawn + OFF_PAWN_CAMPCHECK); if (!chk) return (s_cached = false);
+        const uint8_t* campGuid = (const uint8_t*)chk + OFF_CHK_CAMPID;
+        uint32_t gHiA = *(const uint32_t*)(campGuid + 0);
+        uint32_t gHiB = *(const uint32_t*)(campGuid + 4);
+        return (s_cached = !(gHiA == 0 && gHiB == 0));
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return (s_cached = false); }
 }
 //! A1 — DEBOUNCED "confirmed in camp". The raw NowInsideBaseCampID field can transiently read a zero high half
 //! during camp-boundary recalc / component updates, so a single clientInCamp() miss must NOT clear the pool.
@@ -778,13 +784,13 @@ static bool clientInCampStable() {
 //! client-owned net actor -> reliable transmit, no transmitter-hop). Returns true ONLY if actually sent (the
 //! player is inside a camp). Reads NowInsideBaseCampID off the pawn's InsideBaseCampCheckComponent. Everything
 //! resolved live (no cached ptr -> no dangling crash). ONLY call from on_update (top-level tick).
-static bool chClientTrigger() {
+static bool chClientTriggerInner() {
     UObject* ctrl = UObjectGlobals::FindFirstOf(STR("PalPlayerController")); if (!ctrl) return false;
     UFunction* getPawn = ctrl->GetFunctionByNameInChain(STR("K2_GetPawn")); if (!getPawn) return false;
     struct { UObject* Ret; } pp{}; ctrl->ProcessEvent(getPawn, &pp);
     UObject* pawn = pp.Ret; if (!pawn) return false;
     UObject* chk = *(UObject**)((uint8_t*)pawn + OFF_PAWN_CAMPCHECK);
-    if (!chk) { if (g_verbose && g_chLog < 200) { ++g_chLog; Output::send(STR("[ISGATE] CH skip: no InsideBaseCampCheckComponent poolNow={}\n"), (int)g_pool.size()); } return false; }
+    if (!chk) { if (g_verbose) Output::send(STR("[ISGATE] CH skip: no InsideBaseCampCheckComponent poolNow={}\n"), (int)g_pool.size()); return false; }
     uint8_t* campGuid = (uint8_t*)chk + OFF_CHK_CAMPID;
     //! AUTHORITATIVE in-camp gate — PURE READ, no reflection on `chk`. The raw NowInsideBaseCampID field
     //! @0xC0 is NOT zeroed when the player leaves a camp: the pawn's camp-check slot then reads back a stale
@@ -798,13 +804,13 @@ static bool chClientTrigger() {
     uint32_t gHiA = *(const uint32_t*)(campGuid + 0);
     uint32_t gHiB = *(const uint32_t*)(campGuid + 4);
     if (gHiA == 0 && gHiB == 0) {                                // GUID not valid right now (entering / not yet replicated /
-                                                                 // a transient zero in the raw field). The destructive pool-clear
-                                                                 // that used to live here was the #1 cause of "materials suddenly
-                                                                 // show only the current camp": a single transient zero wiped g_pool
-                                                                 // AND consumed the trigger, with no auto-recovery. Now the pool is
-                                                                 // owned by injectMinted's DEBOUNCED out-of-camp gate (clientInCampStable);
-                                                                 // here we only stop retrying once CONFIRMED out of camp, and otherwise
-                                                                 // keep the trigger so the next on_update tick retries with a valid GUID.
+                                                                  // a transient zero in the raw field). The destructive pool-clear
+                                                                  // that used to live here was the #1 cause of "materials suddenly
+                                                                  // show only the current camp": a single transient zero wiped g_pool
+                                                                  // AND consumed the trigger, with no auto-recovery. Now the pool is
+                                                                  // owned by injectMinted's DEBOUNCED out-of-camp gate (clientInCampStable);
+                                                                  // here we only stop retrying once CONFIRMED out of camp, and otherwise
+                                                                  // keep the trigger so the next on_update tick retries with a valid GUID.
         if (!clientInCampStable()) g_needTrigger = false;        // confirmed out of camp -> stop retrying
         return false;                                            // transient / entering -> keep trigger, retry
     }
@@ -814,8 +820,15 @@ static bool chClientTrigger() {
     struct { FString S; } p{}; p.S = FString(req.c_str());
     ++g_myCalls;
     ctrl->ProcessEvent(fn, &p);
-    if (g_verbose && g_chLog < 200) { ++g_chLog; Output::send(STR("[ISGATE] CH request sent camp={} myCalls={} hookFires={}\n"), hex, (unsigned)g_myCalls, (unsigned)g_hookFires); }
+    if (g_verbose) Output::send(STR("[ISGATE] CH request sent camp={} myCalls={} hookFires={}\n"), hex, (unsigned)g_myCalls, (unsigned)g_hookFires);
     return true;
+}
+static bool chClientTrigger() {
+    __try { return chClientTriggerInner(); }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        if (g_errLog < 64) { ++g_errLog; Output::send(STR("[ISGATE] chClientTrigger: AV guarded (stale UObject) -> skipping this tick\n")); }
+        return false;
+    }
 }
 //! client: EVENT-DRIVEN camp tracking (no polling). OnEnterBaseCamp fires when the local player enters a
 //! camp -> drop the old pool and flag a fresh request (fired from on_update). The reply arrives before a
@@ -826,7 +839,7 @@ static void hkEnterCamp(UnrealScriptFunctionCallableContext& ctx, void*) {
     (void)ctx;
     if (!isClient()) return;
     g_pool.clear(); g_poolDirty = true; g_needTrigger = true;
-    if (g_verbose && g_chLog < 200) { ++g_chLog; Output::send(STR("[ISGATE] CH enter-camp -> flagged\n")); }
+    if (g_verbose) Output::send(STR("[ISGATE] CH enter-camp -> flagged\n"));
 }
 static void hkExitCamp(UnrealScriptFunctionCallableContext& ctx, void*) {
     (void)ctx;   // no-op by design (see note above)
@@ -839,7 +852,7 @@ static void hkPush(UnrealScriptFunctionCallableContext& ctx, void*) {
     (void)ctx;
     if (!isClient()) return;
     g_needTrigger = true;
-    if (g_verbose && g_chLog < 200) { ++g_chLog; Output::send(STR("[ISGATE] CH menu-open (Push) -> flagged\n")); }
+    if (g_verbose) Output::send(STR("[ISGATE] CH menu-open (Push) -> flagged\n"));
 }
 //! client: the CRAFT/production menu does NOT route through UPalUserWidget:Push (confirmed live: build + ESC
 //! fire Push, craft does not). Its UI model binds via UPalUIConvertItemModel:Initialize -> hook that as a
@@ -849,7 +862,7 @@ static void hkCraftOpen(UnrealScriptFunctionCallableContext& ctx, void*) {
     (void)ctx;
     if (!isClient()) return;
     g_needTrigger = true;
-    if (g_verbose && g_chLog < 200) { ++g_chLog; Output::send(STR("[ISGATE] CH menu-open (Craft) -> flagged\n")); }
+    if (g_verbose) Output::send(STR("[ISGATE] CH menu-open (Craft) -> flagged\n"));
 }
 static void installChannel() {
     auto noop    = [](UnrealScriptFunctionCallableContext&, void*) {};
@@ -894,6 +907,7 @@ static void resetState() {
     g_srvInjecting = false; g_injectDepth = 0;
     g_poolDirty = false; g_needTrigger = false;
     g_awaitingReply = false; g_lastTrigAt = 0;
+    g_consecMiss = 0; g_missLogged = 0;                               // channel health re-derived in new world
     g_lastFetchOk = 0;                                              // A4: no fetch in the new world yet
     g_inCampStable = false; g_inCampStreak = 0; g_inCampLastSampleAt = 0;   // A1: re-derive in-camp state in the new world
     g_isSrv = -1; g_isDedi = -1; g_lastWc = nullptr;
@@ -901,10 +915,12 @@ static void resetState() {
     Output::send(STR("[ISGATE] world change -> full state reset\n"));
 }
 static void checkWorld(void* anyObj) {
-    if (!anyObj) return;
-    UObject* w = ((UObject*)anyObj)->GetWorld();
-    if (!w) return;
-    if (w != g_lastWorld) { if (g_lastWorld) resetState(); g_lastWorld = w; }
+    __try {
+        if (!anyObj) return;
+        UObject* w = ((UObject*)anyObj)->GetWorld();
+        if (!w) return;
+        if (w != g_lastWorld) { if (g_lastWorld) resetState(); g_lastWorld = w; }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
 
 // ============================================================================
@@ -1021,12 +1037,30 @@ public:
         }
         //! Resolve role first; do nothing until it's known (title menu has no PalPlayerCharacter).
         if (g_isSrv < 0) { isClient(); return; }
+        //! Periodic heartbeat: always-on (NOT gated by g_verbose or any log cap) so the mod's liveness and
+        //! state are visible even after hundreds of CH log lines. Fires every ~30s.
+        static uint64_t g_lastHeartbeat = 0;
+        if (now - g_lastHeartbeat > 30000) {
+            g_lastHeartbeat = now;
+            const wchar_t* role = g_isSrv == 0 ? L"CLIENT" : (g_isDedi == 1 ? L"DEDI" : L"HOST");
+            uint64_t sinceFetch = g_lastFetchOk ? (unsigned)(now - g_lastFetchOk) : 0;
+            Output::send(STR("[ISGATE] HEARTBEAT role={} pool={} calls={} awaiting={} miss={} inCamp={} sinceFetch={}ms\n"),
+                role, (int)g_pool.size(), (unsigned)g_myCalls, (int)g_awaitingReply, g_consecMiss, (int)g_inCampStable, (unsigned)sinceFetch);
+        }
         //! CLIENT: fire a pending channel trigger here — on_update is a top-level tick (safe for a NetServer
         //! RPC). Flagged by the enter hook / menu-open edge; idle => no trigger => zero traffic.
         if (g_isSrv == 0) {
             //! back-pressure: fire only INSIDE a camp, at most one per CH_MIN_INTERVAL_MS, and never while a
             //! reply is still outstanding. The timeout releases a wedged lock if a reply was ever dropped.
-            if (g_awaitingReply && (now - g_lastTrigAt) > CH_REPLY_TIMEOUT_MS) g_awaitingReply = false;
+            if (g_awaitingReply && (now - g_lastTrigAt) > CH_REPLY_TIMEOUT_MS) {
+                g_awaitingReply = false;
+                ++g_consecMiss;                                   // reply timed out -> channel unhealthy
+                if (g_consecMiss >= 3 && g_missLogged < 3) {
+                    ++g_missLogged;
+                    Output::send(STR("[ISGATE] CH WARNING: {} consecutive replies missed (last trig {}ms ago) — server not responding to this client's camp requests\n"),
+                        g_consecMiss, (unsigned)(now - g_lastTrigAt));
+                }
+            }
             //! A2 — self-heal refresh: while CONFIRMED in camp, re-fetch the pool periodically (every ~12s) and
             //! whenever we have never fetched it. This recovers a pool wiped by a spurious out-of-camp glitch or
             //! a dropped reply WITHOUT waiting for the player to re-enter the camp / reopen a menu (the only other
