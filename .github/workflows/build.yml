@@ -4,7 +4,7 @@ name: Build Mod
 # 对齐 RE-UE4SS 官方 CI (msvc_build_ue4ss.yml)：
 #   - 安装 VS2022 BuildTools 17.9.7（MSVC 14.39 → 工具集 v143，避免 v144 问题）
 #   - xmake 2.9.3 + VS DevShell
-#   - RE-UE4SS 固定 commit f12f0bed
+#   - RE-UE4SS 固定 commit c838a8ac（匹配已安装的 UE4SS v3.0.1 Beta）
 
 on:
   push:
@@ -15,7 +15,7 @@ on:
   workflow_dispatch:
 
 env:
-  RE_UE4SS_COMMIT: f12f0bedc34a0e4fdb05f36953686a13dd10641b
+  RE_UE4SS_COMMIT: c838a8acaade1a0f860bdf249f039e58f4e10088
   MOD_NAME: ModIntegratedStorageCpp
   CONFIG: Game__Shipping__Win64
 
@@ -107,21 +107,6 @@ jobs:
           $content = $content.Replace('on_install(function (package)', "on_install(function (package)$nl$patch")
           Set-Content $file $content
           Write-Host "patched imguitextedit xmake.lua"
-
-      - name: Patch FFrame::Locals ABI to match installed UE4SS v3.0.1
-        shell: pwsh
-        run: |
-          # RE-UE4SS commit f12f0bed declares Locals() returning uint8_t* (QEAAPEAEXZ),
-          # but the installed UE4SS.dll v3.0.1 (c2ac246) exports uint8_t*& (QEAAAEAPEAEXZ).
-          # This ABI mismatch causes ERROR_PROC_NOT_FOUND (0x7f) at LoadLibrary time.
-          # Patch the declaration + implementation to return uint8_t*& to match.
-          $hpp = "RE-UE4SS\deps\first\Unreal\include\Unreal\FFrame.hpp"
-          $cpp = "RE-UE4SS\deps\first\Unreal\src\FFrame.cpp"
-          # Header: change the method declaration (not the struct member fields)
-          (Get-Content $hpp -Raw).Replace('uint8_t* Locals();', 'uint8_t*& Locals();') | Set-Content $hpp -NoNewline
-          # Source: change the method definition
-          (Get-Content $cpp -Raw).Replace('uint8_t* FFrame::Locals()', 'uint8_t*& FFrame::Locals()') | Set-Content $cpp -NoNewline
-          Write-Host "patched FFrame::Locals return type -> uint8_t*&"
 
       - name: Configure & Build (with VS DevShell)
         shell: pwsh
