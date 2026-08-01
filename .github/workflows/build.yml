@@ -63,12 +63,6 @@ jobs:
             ~\.cargo\git
           key: cargo-${{ env.RE_UE4SS_COMMIT }}
 
-      - name: Cache RE-UE4SS build tree (Intermediates)
-        uses: actions/cache@v4
-        with:
-          path: RE-UE4SS\Intermediates
-          key: reue4ss-build-${{ env.RE_UE4SS_COMMIT }}-W${{ steps.cache_key.outputs.key }}
-
       - name: Clone RE-UE4SS (pinned commit, with submodules)
         shell: pwsh
         run: |
@@ -79,6 +73,12 @@ jobs:
           git checkout $env:RE_UE4SS_COMMIT
           git submodule update --init --recursive
           Pop-Location
+
+      - name: Cache RE-UE4SS build tree (Intermediates)
+        uses: actions/cache@v4
+        with:
+          path: RE-UE4SS\Intermediates
+          key: reue4ss-build-${{ env.RE_UE4SS_COMMIT }}-W${{ steps.cache_key.outputs.key }}
 
       - name: Inject mod into RE-UE4SS tree
         shell: pwsh
