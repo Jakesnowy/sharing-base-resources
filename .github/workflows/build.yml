@@ -1,10 +1,8 @@
 name: Build Mod
 
 # 云端编译 ModIntegratedStorageCpp —— 本地零依赖，push 即出 dll。
-# 对齐 RE-UE4SS 官方 CI (msvc_build_ue4ss.yml)：
-#   - 安装 VS2022 BuildTools 17.9.7（MSVC 14.39 → 工具集 v143，避免 v144 问题）
-#   - xmake 2.9.3 + VS DevShell
-#   - RE-UE4SS 固定 commit c838a8ac（匹配已安装的 UE4SS v3.0.1 Beta）
+# 使用 CMake 构建（匹配 RE-UE4SS 官方 CI），runner 自带 VS 2026 + MSVC 14.51。
+# RE-UE4SS 固定 commit c838a8ac（匹配已安装的 UE4SS v3.0.1 Beta）。
 
 on:
   push:
@@ -26,42 +24,37 @@ jobs:
       - name: Checkout mod source
         uses: actions/checkout@v4
 
-      - name: Set xmake globaldir (for caching)
-        run: echo "XMAKE_GLOBALDIR=${{ runner.tool_cache }}/xmake-global" >> $env:GITHUB_ENV
+      - name: Setup MSVC Developer Command Prompt
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+          vsversion: "18"
 
-      - name: Get cache key (weekly)
+      - name: Setup CMake
+        uses: jwlawson/actions-setup-cmake@v2
+        with:
+          cmake-version: 'latest'
+
+      - name: Setup Ninja
+        uses: seanmiddleditch/gha-setup-ninja@v5
+
+      - name: Calculate cache key
         id: cache_key
-        run: echo "key=$(date +'%W')" >> $env:GITHUB_OUTPUT
+        shell: pwsh
+        run: |
+          $commit = $env:RE_UE4SS_COMMIT
+          $key = "cmake-deps-${commit}-W$([math]::Floor([int](Get-Date -Format 'Iyyyww')))"
+          echo "key=$key" >> $env:GITHUB_OUTPUT
 
-      # Install specific VS2022 BuildTools 17.9.7 → MSVC 14.39 (toolset v143).
-      # Runner's default VS (2026 or 17.14) has MSVC 14.44 (_MSC_VER 1944) which
-      # xmake/CMake mis-map to toolset v144, breaking CMake-based package builds.
-      - name: Install VS2022 BuildTools 17.9.7
-        run: choco install -y visualstudio2022buildtools --version=117.9.7.0 --params "--add Microsoft.VisualStudio.Component.VC.Tools.x86.x64 --installChannelUri https://aka.ms/vs/17/release/180911598_-255012421/channel"
-
-      - name: Setup xmake
-        uses: xmake-io/github-action-setup-xmake@v1
-        with:
-          xmake-version: '2.9.3'
-
-      - name: Update xmake repository
-        run: xmake repo --update
-
-      - name: Cache xmake packages
-        uses: actions/cache@v4
-        with:
-          path: ${{ env.XMAKE_GLOBALDIR }}/.xmake/packages
-          key: xmake-pkgs-${{ env.CONFIG }}-${{ env.RE_UE4SS_COMMIT }}-W${{ steps.cache_key.outputs.key }}
-          restore-keys: |
-            xmake-pkgs-${{ env.CONFIG }}-${{ env.RE_UE4SS_COMMIT }}-
-
-      - name: Cache cargo registry (patternsleuth Rust build)
+      - name: Cache CMake dependencies
         uses: actions/cache@v4
         with:
           path: |
-            ~\.cargo\registry
-            ~\.cargo\git
-          key: cargo-${{ env.RE_UE4SS_COMMIT }}
+            build_cmake_shared_deps/_deps
+            build_cmake_shared_deps/ep_downloads
+          key: ${{ steps.cache_key.outputs.key }}
+          restore-keys: |
+            cmake-deps-
 
       - name: Clone RE-UE4SS (pinned commit, with submodules)
         shell: pwsh
@@ -77,91 +70,52 @@ jobs:
       - name: Inject mod into RE-UE4SS tree
         shell: pwsh
         run: |
-          $mod = "RE-UE4SS\cppmods\$env:MOD_NAME\src"
-          New-Item -ItemType Directory -Force -Path $mod | Out-Null
-          Copy-Item src\xmake.lua "RE-UE4SS\cppmods\$env:MOD_NAME\xmake.lua" -Force
-          Copy-Item src\dllmain.cpp "RE-UE4SS\cppmods\$env:MOD_NAME\src\dllmain.cpp" -Force
-          # Register mod in cppmods/xmake.lua (fresh clone won't have it)
-          $cppmodsLua = "RE-UE4SS\cppmods\xmake.lua"
-          $content = Get-Content $cppmodsLua -Raw
+          $modDir = "RE-UE4SS\cppmods\$env:MOD_NAME"
+          $srcDir = "$modDir\src"
+          New-Item -ItemType Directory -Force -Path $srcDir | Out-Null
+          Copy-Item src\CMakeLists.txt "$modDir\CMakeLists.txt" -Force
+          Copy-Item src\dllmain.cpp "$srcDir\dllmain.cpp" -Force
+          # Register mod in cppmods/CMakeLists.txt
+          $cppmodsCmake = "RE-UE4SS\cppmods\CMakeLists.txt"
+          $content = Get-Content $cppmodsCmake -Raw
           if ($content -notmatch [regex]::Escape($env:MOD_NAME)) {
-              Add-Content $cppmodsLua "includes(`"$($env:MOD_NAME)`")"
-              Write-Host "added includes($($env:MOD_NAME)) to cppmods/xmake.lua"
+              $content = $content.Replace(
+                  'add_subdirectory("EventViewerMod")',
+                  "add_subdirectory(`"EventViewerMod`")`nadd_subdirectory(`"$($env:MOD_NAME)`")"
+              )
+              Set-Content $cppmodsCmake $content
+              Write-Host "added add_subdirectory($($env:MOD_NAME)) to cppmods/CMakeLists.txt"
           }
-          Write-Host "mod injected into RE-UE4SS\cppmods\$env:MOD_NAME"
+          Write-Host "mod injected into $modDir"
 
-      - name: Patch ImGuiTextEdit for imgui v1.89 compatibility
+      - name: Configure CMake
         shell: pwsh
         run: |
-          # ImGuiTextEdit commit af78219 uses PushTabStop/PopTabStop (imgui 1.90+ API)
-          # but RE-UE4SS pins imgui v1.89 which lacks these. Patch them out.
-          $file = "RE-UE4SS\deps\third-repo\packages\i\imguitextedit\xmake.lua"
-          $content = Get-Content $file -Raw
-          $nl = "`n"
-          $patch = '    local te = io.readfile("TextEditor.cpp")' + $nl +
-                   '    if te then' + $nl +
-                   '        te = te:gsub("(ImGui::PushTabStop%b())", "// %1")' + $nl +
-                   '        te = te:gsub("(ImGui::PopTabStop%b())", "// %1")' + $nl +
-                   '        io.writefile("TextEditor.cpp", te)' + $nl +
-                   '    end' + $nl + $nl
-          $content = $content.Replace('on_install(function (package)', "on_install(function (package)$nl$patch")
-          Set-Content $file $content
-          Write-Host "patched imguitextedit xmake.lua"
+          $env:FETCHCONTENT_BASE_DIR = "${{ github.workspace }}/build_cmake_shared_deps/_deps"
+          cmake -B build_cmake_msvc_$env:CONFIG `
+            -S RE-UE4SS `
+            -G Ninja `
+            -DCMAKE_BUILD_TYPE="$env:CONFIG" `
+            -DCMAKE_C_COMPILER="cl" `
+            -DCMAKE_CXX_COMPILER="cl" `
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON `
+            -DFETCHCONTENT_QUIET=OFF
 
-      - name: Define WINVER for newer Unreal headers
+      - name: Build mod
         shell: pwsh
         run: |
-          # Unreal submodule b2e876da added #if WINVER <= 0x600 #error in WindowsPlatform.hpp.
-          # MSVC 14.39 doesn't define WINVER by default (evaluates to 0 → triggers the error).
-          # Add global defines to the RE-UE4SS root xmake.lua so all targets get them.
-          $file = "RE-UE4SS\xmake.lua"
-          $content = Get-Content $file -Raw
-          $content = "add_defines(`"WINVER=0x0A00`",`"_WIN32_WINNT=0x0A00`")`n" + $content
-          Set-Content $file $content
-          Write-Host "added WINVER=0x0A00 defines to root xmake.lua"
-
-      - name: Configure & Build (with VS DevShell)
-        shell: pwsh
-        run: |
-          # Initialize MSVC environment using the installed BuildTools 17.9.7
-          Import-Module 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\Microsoft.VisualStudio.DevShell.dll'
-          Enter-VsDevShell -VsInstallPath 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools' -DevCmdArguments '-arch=x64 -host_arch=x64' -SkipAutomaticLocation
-
-          Push-Location RE-UE4SS
-          xmake config -p windows -a x64 -m $env:CONFIG --vs=2022 --versionCheck=n -vD -y
-          xmake build -y $env:MOD_NAME
-          $code = $LASTEXITCODE
-          Pop-Location
-          if ($code -ne 0) { throw "xmake build failed (exit $code)" }
-
-      - name: Dump package install logs on failure
-        if: failure()
-        shell: pwsh
-        run: |
-          $root = "${{ env.XMAKE_GLOBALDIR }}\.xmake\packages"
-          $logs = Get-ChildItem -Path $root -Recurse -Filter "install.txt" -ErrorAction SilentlyContinue
-          foreach ($l in $logs) {
-            Write-Host "========== $($l.FullName) =========="
-            Get-Content $l.FullName | Select-Object -Last 50
-          }
+          cmake --build build_cmake_msvc_$env:CONFIG --target $env:MOD_NAME --verbose
 
       - name: Assemble installable mod
         shell: pwsh
         run: |
-          # xmake ue4ss.base rule sets targetdir = <projectdir>/Binaries/<mode>/<targetname>/
-          $expected = "RE-UE4SS\Binaries\$env:CONFIG\$env:MOD_NAME\$env:MOD_NAME.dll"
-          $dll = $null
-          if (Test-Path $expected) { $dll = Get-Item $expected }
+          $buildDir = "build_cmake_msvc_$env:CONFIG"
+          $dll = Get-ChildItem -Path $buildDir -Recurse -Filter "$env:MOD_NAME.dll" -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -notlike "*\_deps\*" } |
+            Select-Object -First 1
           if (-not $dll) {
-            Write-Host "DLL not at expected path ($expected). Searching..."
-            $dll = Get-ChildItem -Path RE-UE4SS -Recurse -Filter "$env:MOD_NAME.dll" -ErrorAction SilentlyContinue | Select-Object -First 1
-          }
-          if (-not $dll) {
-            Write-Host "Still not found. All DLLs under RE-UE4SS:"
-            Get-ChildItem -Path RE-UE4SS -Recurse -Filter "*.dll" -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "  $($_.FullName)" }
-            Push-Location RE-UE4SS
-            xmake show -t $env:MOD_NAME 2>&1 | Select-Object -First 20
-            Pop-Location
+            Write-Host "DLL not found. All DLLs in build dir:"
+            Get-ChildItem -Path $buildDir -Recurse -Filter "*.dll" | ForEach-Object { Write-Host "  $($_.FullName)" }
             throw "compiled $env:MOD_NAME.dll not found"
           }
           Write-Host "found dll: $($dll.FullName)"
