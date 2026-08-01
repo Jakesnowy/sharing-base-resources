@@ -116,7 +116,7 @@ jobs:
           Enter-VsDevShell -VsInstallPath 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools' -DevCmdArguments '-arch=x64 -host_arch=x64' -SkipAutomaticLocation
 
           Push-Location RE-UE4SS
-          xmake config -p windows -a x64 -m $env:CONFIG --vs=2022 -vD -y
+          xmake config -p windows -a x64 -m $env:CONFIG --vs=2022 --versionCheck=n -vD -y
           xmake build -y $env:MOD_NAME
           $code = $LASTEXITCODE
           Pop-Location
