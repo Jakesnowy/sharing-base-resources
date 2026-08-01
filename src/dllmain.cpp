@@ -449,6 +449,7 @@ static int64_t __fastcall hkAc0(void* a1, void* a2, void* r, void* o) {
 //  SERVER — discovery reconcile + container cross-registration (authority only)
 // ============================================================================
 static const wchar_t*  SRV_CHEST_CLASS  = L"PalMapObjectItemChestModel";
+static const wchar_t*  SRV_FOOD_CLASS   = L"PalMapObjectPalFoodBoxModel";
 static const uintptr_t OFF_CAMP_MODULES = 0x180;   // UPalBaseCampModel.ModuleArray (TArray<module*>)
 static const uintptr_t OFF_CAMP_GROUPID = 0xE4;    // UPalBaseCampModel.GroupIdBelongTo (FGuid) -> guild key
 
@@ -524,10 +525,12 @@ static void srvDiscoverReconcileInner() {
         if (((words[i >> 5] >> (i & 31)) & 1u) == 0) continue;                 // skip free slots
         uint8_t*  keyId = elems + (size_t)i * 0x20 + 0x00;                     // TPair::Key = FGuid instance id
         UObject* model  = *(UObject**)(elems + (size_t)i * 0x20 + 0x10);       // TPair::Value = concrete model
-        if (!model || !srvClassIs(model, SRV_CHEST_CLASS)) continue;
+        if (!model) continue;
+        const bool isChest = srvClassIs(model, SRV_CHEST_CLASS);
+        if (!isChest && !srvClassIs(model, SRV_FOOD_CLASS)) continue;
         UObject* camp = srvCampModelOf(model); if (!camp) continue;
         GuildData& g = fresh[srvGuildKey(camp)];
-        g.models.insert(model); g.modelCamp[model] = camp;
+        if (isChest) { g.models.insert(model); g.modelCamp[model] = camp; }
         UObject* st = srvStorageOf(camp); if (st) { g.storages.insert(st); g.storageCamp[st] = camp; }
         wchar_t ih[33]; hexOf(keyId, ih); freshInst[ih] = camp;
         ++chests;
