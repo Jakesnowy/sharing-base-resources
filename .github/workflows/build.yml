@@ -108,6 +108,18 @@ jobs:
           Set-Content $file $content
           Write-Host "patched imguitextedit xmake.lua"
 
+      - name: Define WINVER for newer Unreal headers
+        shell: pwsh
+        run: |
+          # Unreal submodule b2e876da added #if WINVER <= 0x600 #error in WindowsPlatform.hpp.
+          # MSVC 14.39 doesn't define WINVER by default (evaluates to 0 → triggers the error).
+          # Add global defines to the RE-UE4SS root xmake.lua so all targets get them.
+          $file = "RE-UE4SS\xmake.lua"
+          $content = Get-Content $file -Raw
+          $content = "add_defines(`"WINVER=0x0A00`",`"_WIN32_WINNT=0x0A00`")`n" + $content
+          Set-Content $file $content
+          Write-Host "added WINVER=0x0A00 defines to root xmake.lua"
+
       - name: Configure & Build (with VS DevShell)
         shell: pwsh
         run: |
