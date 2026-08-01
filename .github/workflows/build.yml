@@ -114,6 +114,21 @@ jobs:
           Set-Content $file $content
           Write-Host "patched imguitextedit xmake.lua"
 
+      - name: Patch FFrame::Locals ABI to match installed UE4SS v3.0.1
+        shell: pwsh
+        run: |
+          # RE-UE4SS commit f12f0bed declares Locals() returning uint8_t* (QEAAPEAEXZ),
+          # but the installed UE4SS.dll v3.0.1 (c2ac246) exports uint8_t*& (QEAAAEAPEAEXZ).
+          # This ABI mismatch causes ERROR_PROC_NOT_FOUND (0x7f) at LoadLibrary time.
+          # Patch the declaration + implementation to return uint8_t*& to match.
+          $hpp = "RE-UE4SS\deps\first\Unreal\include\Unreal\FFrame.hpp"
+          $cpp = "RE-UE4SS\deps\first\Unreal\src\FFrame.cpp"
+          # Header: change the method declaration (not the struct member fields)
+          (Get-Content $hpp -Raw).Replace('uint8_t* Locals();', 'uint8_t*& Locals();') | Set-Content $hpp -NoNewline
+          # Source: change the method definition
+          (Get-Content $cpp -Raw).Replace('uint8_t* FFrame::Locals()', 'uint8_t*& FFrame::Locals()') | Set-Content $cpp -NoNewline
+          Write-Host "patched FFrame::Locals return type -> uint8_t*&"
+
       - name: Configure & Build (with VS DevShell)
         shell: pwsh
         run: |
@@ -142,12 +157,17 @@ jobs:
       - name: Assemble installable mod
         shell: pwsh
         run: |
-          # Search broadly for the compiled DLL
-          $dll = Get-ChildItem -Path RE-UE4SS -Recurse -Filter "$env:MOD_NAME.dll" -ErrorAction SilentlyContinue | Select-Object -First 1
+          # xmake ue4ss.base rule sets targetdir = <projectdir>/Binaries/<mode>/<targetname>/
+          $expected = "RE-UE4SS\Binaries\$env:CONFIG\$env:MOD_NAME\$env:MOD_NAME.dll"
+          $dll = $null
+          if (Test-Path $expected) { $dll = Get-Item $expected }
           if (-not $dll) {
-            Write-Host "DLL not found by name. Searching for all DLLs under RE-UE4SS:"
+            Write-Host "DLL not at expected path ($expected). Searching..."
+            $dll = Get-ChildItem -Path RE-UE4SS -Recurse -Filter "$env:MOD_NAME.dll" -ErrorAction SilentlyContinue | Select-Object -First 1
+          }
+          if (-not $dll) {
+            Write-Host "Still not found. All DLLs under RE-UE4SS:"
             Get-ChildItem -Path RE-UE4SS -Recurse -Filter "*.dll" -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "  $($_.FullName)" }
-            # Also try xmake to list target output
             Push-Location RE-UE4SS
             xmake show -t $env:MOD_NAME 2>&1 | Select-Object -First 20
             Pop-Location
