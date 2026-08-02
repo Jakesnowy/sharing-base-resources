@@ -456,6 +456,7 @@ static const wchar_t*  SRV_CHEST_CLASS  = L"PalMapObjectItemChestModel";
 static const wchar_t*  SRV_FOOD_CLASS   = L"PalMapObjectPalFoodBoxModel";
 static const uintptr_t OFF_CAMP_MODULES = 0x180;   // UPalBaseCampModel.ModuleArray (TArray<module*>)
 static const uintptr_t OFF_CAMP_GROUPID = 0xE4;    // UPalBaseCampModel.GroupIdBelongTo (FGuid) -> guild key
+static const uintptr_t OFF_CAMP_ID      = 0x58;    // UPalBaseCampModel.ID (FGuid) = the camp's own id
 static const uintptr_t OFF_CONT_MGR_MAP = 0x98;   // UPalItemContainerManager.ItemContainerMap_InServer (TMap)
 
 struct GuildData {
@@ -688,7 +689,6 @@ static const wchar_t*  CH_REQ_SENTINEL = L"ISREQ|";   // request payload tag: IS
 //! effect (unlike the MapObject dev RPCs, whose native bodies dismantle/rename map objects).
 static const CharType* CH_REQ_FN   = STR("Debug_CheatCommand_ToServer");           // client->server request (FString)
 static const CharType* CH_REPLY_FN = STR("Debug_ReceiveCheatCommand_ToClient");    // server->client reply   (FString)
-static const uintptr_t OFF_CAMP_ID        = 0x58;    // UPalBaseCampModel.ID (FGuid) = the camp's own id (== client NowInsideBaseCampID)
 static const uintptr_t OFF_PAWN_CAMPCHECK = 0xC08;   // APalPlayerCharacter.InsideBaseCampCheckComponent
 static const uintptr_t OFF_CHK_CAMPID     = 0xC0;    // UPalInsideBaseCampCheckComponent.NowInsideBaseCampID (FGuid)
 //! server: find the base camp whose OWN id (@0x58) matches the client-supplied camp GUID. No player/connection
@@ -915,7 +915,7 @@ static void hkEnterCamp(UnrealScriptFunctionCallableContext& ctx, void*) {
     //! that saturated the reliable channel and stalled ALL game interactions (pal summon, eat, build, etc).
     //! Filter: only react when the PalBuilderComponent that fired belongs to the LOCAL player.
     if (ctx.Context) {
-        UObject* eventOwner = ctx.Context->GetOuter();   // PalBuilderComponent -> owning character
+        UObject* eventOwner = ctx.Context->GetOuterPrivate();   // PalBuilderComponent -> owning character
         __try {
             UObject* ctrl = UObjectGlobals::FindFirstOf(STR("PalPlayerController"));
             if (ctrl) {
