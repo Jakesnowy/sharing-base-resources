@@ -127,7 +127,8 @@ static bool chClientTrigger();
 static int g_isSrv  = -1;   // -1 unknown, 0 remote client, 1 authority (dedicated/host/standalone)
 static int g_isDedi = -1;   // -1 unknown, 0 no, 1 dedicated server (informational: distinguishes dedicated vs host/SP)
 static UObject* g_palUtil = nullptr;
-static bool callUtilBool(const CharType* fnName, void* wc) {
+static bool callUtilBool(const CharType* fnName, void* wc, bool* faulted = nullptr) {
+    if (faulted) *faulted = false;
     __try {
         if (!wc) return false;
         if (!g_palUtil) g_palUtil = UObjectGlobals::StaticFindObject<UObject*>(nullptr, nullptr, STR("/Script/Pal.Default__PalUtility"));
@@ -137,12 +138,25 @@ static bool callUtilBool(const CharType* fnName, void* wc) {
         struct { UObject* WorldContext; bool Ret; uint8_t pad[7]; } p{}; p.WorldContext = (UObject*)wc;
         g_palUtil->ProcessEvent(fn, &p);
         return p.Ret;
-    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        //! An AV here (e.g. `wc` is a half-destroyed PalPlayerCharacter whose world context is being torn down)
+        //! is NOT "IsServer returned false" — it's a transient fault. Report it via `faulted` so callers
+        //! (ensureRole / the ROLE watchdog) can distinguish a real role change from a swallowed fault. Without
+        //! this, the watchdog treated every transient AV as a genuine server->client role flip and nuked all
+        //! state, permanently re-deriving a dedicated server as a CLIENT (2026-08-02 outage: 20:50:49).
+        if (faulted) *faulted = true;
+        return false;
+    }
 }
 static void ensureRole(void* wc) {
     if (g_isSrv >= 0 || !wc) return;
-    g_isSrv  = callUtilBool(STR("IsServer"), wc) ? 1 : 0;
+    bool faulted = false;
+    g_isSrv  = callUtilBool(STR("IsServer"), wc, &faulted) ? 1 : 0;
     g_isDedi = callUtilBool(STR("IsDedicatedServer"), wc) ? 1 : 0;
+    //! If the IsServer probe FAULTED (transient AV on a half-destroyed WorldContext), do NOT commit a wrong
+    //! "client" (g_isSrv=0) role — leave it unknown and let the next probe retry. Committing 0 here on a
+    //! dedicated server would make every server-side guard short-circuit until a world change.
+    if (faulted) { g_isSrv = -1; return; }
     Output::send(STR("[ISGATE] ROLE server={} dedicated={} -> {}\n"), g_isSrv, g_isDedi,
         g_isSrv == 0 ? STR("CLIENT (display)") : (g_isDedi == 1 ? STR("DEDICATED (server)") : STR("HOST/SP (server)")));
 }
@@ -762,7 +776,15 @@ static void srvBuildForCamp(UObject* camp, std::wstring& out) {
 //! PalPlayerController. Read the FString; if it's our request, parse the client-supplied camp GUID, build
 //! (guild - that camp), and reply on the SAME controller via Debug_ReceiveCheatCommand_ToClient (routes to
 //! that one client). A real cheat command (not our sentinel) is ignored. Client's own local echo -> isClient().
-static void hkChRequest(UnrealScriptFunctionCallableContext& ctx, void*) {
+//!
+//! CRITICAL: the reply `ctrl->ProcessEvent(rf, &rp)` MUST run under an SEH guard. `ctrl` is the requester's
+//! server-side PlayerController; if that player disconnects mid-request the pointer dangles and the call AVs.
+//! Without a guard the unhandled fault escapes into UE4SS's ProcessEvent hook dispatch and SILENTLY KILLS the
+//! `Debug_CheatCommand_ToServer` hook for the rest of the session — the server keeps ticking (reconcile +
+//! heartbeat survive because they don't go through this hook) but never replies again. This was the root cause
+//! of the 2026-08-02 outage (last reply at 20:48:42, then permanent silence). The split into inner + wrapper
+//! (no C++ objects with destructors in the wrapper) mirrors srvBuildForCamp so it compiles under /EHsc.
+static void hkChRequestInner(UnrealScriptFunctionCallableContext& ctx, void*) {
     if (isClient()) return;
     UObject* ctrl = ctx.Context; if (!ctrl) return;              // the requester's PalPlayerController (server-side)
     struct P { RawTArray S; };                                   // FString Command == TArray<wchar_t> {data,num,max}
@@ -780,6 +802,16 @@ static void hkChRequest(UnrealScriptFunctionCallableContext& ctx, void*) {
     struct { FString S; } rp{}; rp.S = FString(payload.c_str());
     ctrl->ProcessEvent(rf, &rp);
     if (g_verbose) Output::send(STR("[ISGATE] CH reply sent len={}\n"), (int)payload.size());
+}
+//! (a) SEH wrapper: a requester controller freed mid-request (player disconnect / GC) would AV on the reply
+//! ProcessEvent. Guard it so a fault yields "no reply this tick" instead of escaping into UE4SS's hook dispatch
+//! and permanently killing the channel. The wrapper holds no C++ objects with destructors (ctx is a ref) so it
+//! compiles under /EHsc. The client simply re-fetches on its next trigger (A2 self-heal).
+static void hkChRequest(UnrealScriptFunctionCallableContext& ctx, void* ud) {
+    __try { hkChRequestInner(ctx, ud); }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        if (g_errLog < 64) { ++g_errLog; Output::send(STR("[ISGATE] CH req: AV guarded (stale requester controller) -> no reply this tick\n")); }
+    }
 }
 //! client receiver: hooked on Debug_ReceiveCheatCommand_ToClient. If the string carries our sentinel, parse it
 //! into g_pool; otherwise leave it alone. Server's own local echo -> !isClient() guard.
@@ -1057,7 +1089,7 @@ class ModIntegratedStorageCpp : public CppUserModBase
 public:
     ModIntegratedStorageCpp() : CppUserModBase()
     {
-        ModName = STR("IntegratedStorageCpp"); ModVersion = STR("3.5");   // 3.5: hkEnterCamp local-player filter (fixes multiplayer pool thrashing + RPC storm); srvCampById cache (eliminates per-request FindAllOf); food-box cross-registration (was discovered but never registered -> building couldn't consume cross-camp food)
+        ModName = STR("IntegratedStorageCpp"); ModVersion = STR("3.5.1");   // 3.5.1: hotfix — hkChRequest now SEH-guarded (unhandled AV on a disconnecting requester PC was killing the Debug_CheatCommand hook for the whole session); callUtilBool reports faults so ensureRole/watchdog distinguish a transient IsServer AV from a real role flip (was permanently re-deriving a dedicated server as CLIENT)
         ModDescription = STR("Cross-camp build/craft: use any same-guild camp's stored materials at any camp. Server cross-registers guild containers; the remote client displays the guild total via a custom ISI-free transport channel. AOB-signature located (survives game updates).");
         ModAuthors = STR("Sarfflow");
     }
@@ -1114,8 +1146,16 @@ public:
             g_lastRoleCheck = now;
             UObject* pc = UObjectGlobals::FindFirstOf(STR("PalPlayerCharacter"));
             if (pc) {
-                int fresh = callUtilBool(STR("IsServer"), pc) ? 1 : 0;
-                if (g_isSrv >= 0 && g_isSrv != fresh) {
+                bool faulted = false;
+                int fresh = callUtilBool(STR("IsServer"), pc, &faulted) ? 1 : 0;
+                //! A FAULT here (transient AV while the first PalPlayerCharacter is being torn down / its world
+                //! mid-replication) must NOT be treated as a real role change — it is indistinguishable from
+                //! "IsServer=false" only if we ignore the fault flag, which is what flipped a dedicated server
+                //! to CLIENT on 2026-08-02 (20:50:49: cached=1 fresh=0 -> full reset). Skip this tick instead;
+                //! the next ~10s probe re-reads on a (likely) stable character.
+                if (faulted) {
+                    if (g_errLog < 64) { ++g_errLog; Output::send(STR("[ISGATE] ROLE watchdog: IsServer probe faulted (transient AV) -> skip this check\n")); }
+                } else if (g_isSrv >= 0 && g_isSrv != fresh) {
                     if (g_errLog < 64) { ++g_errLog; Output::send(STR("[ISGATE] ROLE watchdog: cached={} fresh={} -> full reset\n"), g_isSrv, fresh); }
                     resetState();   // g_isSrv -> -1 + drop all cached world state; re-derived next tick
                 }
