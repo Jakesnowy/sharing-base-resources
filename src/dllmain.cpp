@@ -61,6 +61,16 @@ using namespace RC::Unreal;
 struct RawTArray { uint8_t* data; int32_t num; int32_t max; };
 
 // ============================================================================
+//  DIAGNOSTIC ISOLATION FLAGS (uncomment ONE to isolate a subsystem for testing)
+// ============================================================================
+// ISOLATE_INJECT_ONLY: keeps injectMinted (slot swap) fully active, disables the
+//   Debug_CheatCommand RPC channel entirely (no request/reply hooks, no trigger).
+//   If interaction failure STILL happens with this build -> injectMinted swap is the cause.
+//   If failure STOPS -> the CH RPC channel (Debug_CheatCommand abuse) is the cause.
+//#define ISOLATE_INJECT_ONLY
+#define ISOLATE_INJECT_ONLY
+
+// ============================================================================
 //  Config (config.txt beside the mod; parsed at load — see loadConfig)
 // ============================================================================
 //! Pre-stable build -> verbose logging DEFAULTS ON so field issues are diagnosable; users can quiet it and
@@ -987,8 +997,10 @@ static void installChannel() {
     auto trigPre = [](UnrealScriptFunctionCallableContext&, void*) { ++g_hookFires; };   // count EVERY local fire of the request RPC
     //! Core channel (request/reply on the PlayerController + enter/exit): proven paths, one try.
     try {
+#ifndef ISOLATE_INJECT_ONLY
         UObjectGlobals::RegisterHook(STR("/Script/Pal.PalPlayerController:Debug_CheatCommand_ToServer"),          trigPre, hkChRequest, nullptr);
         UObjectGlobals::RegisterHook(STR("/Script/Pal.PalPlayerController:Debug_ReceiveCheatCommand_ToClient"),   noop,    hkChReply,   nullptr);
+#endif
         UObjectGlobals::RegisterHook(STR("/Script/Pal.PalBuilderComponent:OnEnterBaseCamp"),                      noop,    hkEnterCamp, nullptr);
         UObjectGlobals::RegisterHook(STR("/Script/Pal.PalBuilderComponent:OnExitBaseCamp"),                       noop,    hkExitCamp,  nullptr);
         Output::send(STR("[ISGATE] core channel hooks OK (request=Debug_CheatCommand reply=Debug_ReceiveCheatCommand + enter/exit)\n"));
@@ -1089,7 +1101,7 @@ class ModIntegratedStorageCpp : public CppUserModBase
 public:
     ModIntegratedStorageCpp() : CppUserModBase()
     {
-        ModName = STR("IntegratedStorageCpp"); ModVersion = STR("3.5.1");   // 3.5.1: hotfix — hkChRequest now SEH-guarded (unhandled AV on a disconnecting requester PC was killing the Debug_CheatCommand hook for the whole session); callUtilBool reports faults so ensureRole/watchdog distinguish a transient IsServer AV from a real role flip (was permanently re-deriving a dedicated server as CLIENT)
+        ModName = STR("IntegratedStorageCpp"); ModVersion = STR("3.5.2");
         ModDescription = STR("Cross-camp build/craft: use any same-guild camp's stored materials at any camp. Server cross-registers guild containers; the remote client displays the guild total via a custom ISI-free transport channel. AOB-signature located (survives game updates).");
         ModAuthors = STR("Sarfflow");
     }
@@ -1105,6 +1117,9 @@ public:
         loadConfig();
         const uintptr_t base = (uintptr_t)GetModuleHandleW(nullptr);
         Output::send(STR("[ISGATE] === IntegratedStorage {} loaded, base {:#x} ===\n"), ModVersion, base);
+#ifdef ISOLATE_INJECT_ONLY
+        Output::send(STR("[ISGATE] *** ISOLATION BUILD: CH RPC channel DISABLED — injectMinted only ***\n"));
+#endif
         Output::send(STR("[ISGATE] config: verbose={} reconcile_ms={}\n"), g_verbose, (int)g_reconcileMs);
         initExecRanges(base);
         Output::send(STR("[ISGATE] exec sections={}\n"), (int)g_exec.size());
@@ -1193,11 +1208,13 @@ public:
             //! trigger sources) — that wait was the reason materials could stay "only current camp" indefinitely.
             //! Bounded by the back-pressure guard below, so it can't flood the channel.
             if (clientInCampStable() && (g_lastFetchOk == 0 || now - g_lastFetchOk > 12000)) g_needTrigger = true;
+#ifndef ISOLATE_INJECT_ONLY
             if (g_needTrigger && !g_awaitingReply && (now - g_lastTrigAt) > CH_MIN_INTERVAL_MS) {
                 g_lastTrigAt = now;                                  // throttle ATTEMPTS (in-camp check is inside chClientTrigger)
                 g_common = findCommonContainer(); g_donorCont = findDonorContainer();
                 if (chClientTrigger()) { g_needTrigger = false; g_awaitingReply = true; }   // consume + await only if actually sent
             }
+#endif
             return;
         }
         //! AUTHORITY: ~8s discovery reconcile (guild state + container cross-registration for consume).
