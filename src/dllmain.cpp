@@ -456,6 +456,7 @@ static const wchar_t*  SRV_CHEST_CLASS  = L"PalMapObjectItemChestModel";
 static const wchar_t*  SRV_FOOD_CLASS   = L"PalMapObjectPalFoodBoxModel";
 static const uintptr_t OFF_CAMP_MODULES = 0x180;   // UPalBaseCampModel.ModuleArray (TArray<module*>)
 static const uintptr_t OFF_CAMP_GROUPID = 0xE4;    // UPalBaseCampModel.GroupIdBelongTo (FGuid) -> guild key
+static const uintptr_t OFF_CONT_MGR_MAP = 0x98;   // UPalItemContainerManager.ItemContainerMap_InServer (TMap)
 
 struct GuildData {
     std::unordered_set<UObject*> storages, models;
@@ -465,6 +466,7 @@ struct GuildData {
 static std::unordered_map<std::wstring, GuildData> g_guilds;
 static std::unordered_map<std::wstring, UObject*> g_instToCamp;  // chest map-object instance-id (hex) -> its camp
 static std::unordered_map<std::wstring, UObject*> g_instToCont;   // B2: chest instance-id (hex) -> its UPalItemContainer (rebuilt each reconcile)
+static std::unordered_map<std::wstring, UObject*> g_campIdToCamp; // B3: camp-id (hex of FGuid@0x58) -> camp object (rebuilt each reconcile)
 static std::unordered_map<UObject*, std::unordered_set<UObject*>> g_registered;  // B1: storage -> {models already cross-registered into it this world}
 static bool g_srvInjecting = false;   // re-entrancy guard (our cross-register calls re-fire the storage events)
 
@@ -524,6 +526,7 @@ static void srvDiscoverReconcileInner() {
     if (!elems || maxIdx <= 0 || maxIdx > 1000000) return;
     std::unordered_map<std::wstring, GuildData> fresh;
     std::unordered_map<std::wstring, UObject*> freshInst;
+    std::unordered_map<std::wstring, UObject*> freshCampId;   // B3: camp-id (hex) -> camp object
     int chests = 0;
     for (int32_t i = 0; i < maxIdx; ++i) {
         if (((words[i >> 5] >> (i & 31)) & 1u) == 0) continue;                 // skip free slots
@@ -534,26 +537,91 @@ static void srvDiscoverReconcileInner() {
         if (!isChest && !srvClassIs(model, SRV_FOOD_CLASS)) continue;
         UObject* camp = srvCampModelOf(model); if (!camp) continue;
         GuildData& g = fresh[srvGuildKey(camp)];
-        if (isChest) { g.models.insert(model); g.modelCamp[model] = camp; }
+        //! Both chests AND food boxes are cross-registered: some build recipes require food items, and the
+        //! user wants those pullable from any same-guild camp's food box. Previously only chests were in
+        //! g.models (the `if (isChest)` guard), so food boxes were discovered but never registered -> building
+        //! at camp A couldn't consume food stored in camp B's food box.
+        g.models.insert(model); g.modelCamp[model] = camp;
         UObject* st = srvStorageOf(camp); if (st) { g.storages.insert(st); g.storageCamp[st] = camp; }
         wchar_t ih[33]; hexOf(keyId, ih); freshInst[ih] = camp;
+        wchar_t ch[33]; hexOf((uint8_t*)camp + OFF_CAMP_ID, ch); freshCampId[ch] = camp;
         ++chests;
     }
     int campsSeen = 0;   // (b) every camp, incl. empty ones, becomes a cross-registration target
-    { std::vector<UObject*> camps; UObjectGlobals::FindAllOf(STR("PalBaseCampModel"), camps);
-      for (UObject* camp : camps) { if (!camp) continue;
-          GuildData& g = fresh[srvGuildKey(camp)];
-          UObject* st = srvStorageOf(camp); if (st) { g.storages.insert(st); g.storageCamp[st] = camp; }
-          ++campsSeen; } }
+    //! B4 — enumerate ALL camps via PalBaseCampManager native API instead of FindAllOf("PalBaseCampModel").
+    //! GetBaseCampIds() returns every camp's FGuid in one ProcessEvent call; TryGetModel() resolves each
+    //! GUID to its PalBaseCampModel (O(1) hash lookup inside the engine vs O(all UObjects) FindAllOf scan).
+    //! Falls back to FindAllOf if the manager or its functions aren't found (game update / different build).
+    { bool b4ok = false;
+      UObject* campMgr = UObjectGlobals::FindFirstOf(STR("BP_PalBaseCampManager_C"));
+      if (!campMgr) campMgr = UObjectGlobals::FindFirstOf(STR("PalBaseCampManager"));
+      UFunction* getIdsFn = campMgr ? campMgr->GetFunctionByNameInChain(STR("GetBaseCampIds")) : nullptr;
+      UFunction* tryGetFn  = campMgr ? campMgr->GetFunctionByNameInChain(STR("TryGetModel"))   : nullptr;
+      if (campMgr && getIdsFn && tryGetFn) {
+          struct { RawTArray OutIds; } idP{};                    // TArray<FGuid> output (zeroed)
+          campMgr->ProcessEvent(getIdsFn, &idP);
+          if (idP.OutIds.data && idP.OutIds.num > 0 && idP.OutIds.num < 100000) {
+              b4ok = true;
+              for (int32_t ci = 0; ci < idP.OutIds.num; ++ci) {
+                  uint8_t* gid = idP.OutIds.data + (size_t)ci * 16;   // each FGuid is 16 bytes
+                  struct { uint8_t Id[16]; UObject* Out; bool Ret; } tp{};
+                  std::memcpy(tp.Id, gid, 16);
+                  campMgr->ProcessEvent(tryGetFn, &tp);
+                  if (!tp.Ret || !tp.Out) continue;
+                  UObject* camp = tp.Out;
+                  GuildData& g = fresh[srvGuildKey(camp)];
+                  UObject* st = srvStorageOf(camp); if (st) { g.storages.insert(st); g.storageCamp[st] = camp; }
+                  wchar_t ch[33]; hexOf((uint8_t*)camp + OFF_CAMP_ID, ch); freshCampId[ch] = camp;
+                  ++campsSeen;
+              }
+          }
+      }
+      if (!b4ok) {
+          if (g_verbose && g_recLog < 10) Output::send(STR("[ISGATE] B4 fallback: PalBaseCampManager API unavailable -> FindAllOf(PalBaseCampModel)\n"));
+          std::vector<UObject*> camps; UObjectGlobals::FindAllOf(STR("PalBaseCampModel"), camps);
+          for (UObject* camp : camps) { if (!camp) continue;
+              GuildData& g = fresh[srvGuildKey(camp)];
+              UObject* st = srvStorageOf(camp); if (st) { g.storages.insert(st); g.storageCamp[st] = camp; }
+              wchar_t ch[33]; hexOf((uint8_t*)camp + OFF_CAMP_ID, ch); freshCampId[ch] = camp;
+              ++campsSeen; }
+      } }
     //! B2 — build instance-id -> container map ONCE per reconcile so srvBuildForCamp (per client request) can
     //! resolve a chest's container directly instead of FindAllOf("PalItemContainer") on EVERY request
     //! (O(all UObjects) each). Only camp-storage containers carry a non-zero OwnerMapObjectInstanceId (@0xF8);
     //! player inventories are skipped. Both maps below are read on the same game thread in srvBuildForCamp.
     std::unordered_map<std::wstring, UObject*> freshCont;
-    { std::vector<UObject*> conts; UObjectGlobals::FindAllOf(STR("PalItemContainer"), conts);
-      for (UObject* c : conts) { if (!c) continue; uint8_t* cp = (uint8_t*)c;
-          if (guidZero(cp + OFF_CONT_OWNER)) continue;
-          wchar_t ih[33]; hexOf(cp + OFF_CONT_OWNER, ih); freshCont[ih] = c; } }
+    //! B4 — read ItemContainerMap_InServer (TMap at OFF_CONT_MGR_MAP on PalItemContainerManager) directly
+    //! instead of FindAllOf("PalItemContainer"). The TMap maps ContainerId -> PalItemContainer*; we walk its
+    //! sparse-array backing (same layout as MapObjectManager's TMap at 0x310: element stride 0x20, key at +0x00,
+    //! value pointer at +0x10) and read each container's OwnerMapObjectInstanceId (@0xF8) to build the
+    //! instance-id -> container map. Falls back to FindAllOf if the manager or TMap is invalid.
+    { bool b4c = false;
+      UObject* contMgr = UObjectGlobals::FindFirstOf(STR("BP_PalItemContainerManager_C"));
+      if (!contMgr) contMgr = UObjectGlobals::FindFirstOf(STR("PalItemContainerManager"));
+      if (contMgr) {
+          uint8_t* cm = (uint8_t*)contMgr + OFF_CONT_MGR_MAP;          // ItemContainerMap_InServer TMap
+          uint8_t* cElems  = *(uint8_t**)(cm + 0x00);                   // sparse-array element buffer
+          int32_t  cMaxIdx = *(int32_t*)(cm + 0x08);                    // slots incl. holes
+          uint32_t* cWords = *(uint32_t**)(cm + 0x20); if (!cWords) cWords = (uint32_t*)(cm + 0x10);
+          if (cElems && cMaxIdx > 0 && cMaxIdx < 1000000 && cWords) {
+              b4c = true;
+              for (int32_t ci = 0; ci < cMaxIdx; ++ci) {
+                  if (((cWords[ci >> 5] >> (ci & 31)) & 1u) == 0) continue;       // skip free slots
+                  UObject* cont = *(UObject**)(cElems + (size_t)ci * 0x20 + 0x10); // TPair::Value
+                  if (!cont) continue;
+                  uint8_t* cp = (uint8_t*)cont;
+                  if (guidZero(cp + OFF_CONT_OWNER)) continue;
+                  wchar_t ih[33]; hexOf(cp + OFF_CONT_OWNER, ih); freshCont[ih] = cont;
+              }
+          }
+      }
+      if (!b4c) {
+          if (g_verbose && g_recLog < 10) Output::send(STR("[ISGATE] B4 fallback: ItemContainerMap unavailable -> FindAllOf(PalItemContainer)\n"));
+          std::vector<UObject*> conts; UObjectGlobals::FindAllOf(STR("PalItemContainer"), conts);
+          for (UObject* c : conts) { if (!c) continue; uint8_t* cp = (uint8_t*)c;
+              if (guidZero(cp + OFF_CONT_OWNER)) continue;
+              wchar_t ih[33]; hexOf(cp + OFF_CONT_OWNER, ih); freshCont[ih] = c; }
+      } }
     //! B1 — DIFF the cross-registration. Prune g_registered down to the storages still live this pass (so a
     //! destroyed camp doesn't leak entries), then register only the (storage,model) pairs we have NOT already
     //! registered this world. Steady state (no new chest/camp) -> ZERO ProcessEvent calls per reconcile instead
@@ -577,7 +645,8 @@ static void srvDiscoverReconcileInner() {
     g_guilds = std::move(fresh);
     g_instToCamp = std::move(freshInst);
     g_instToCont = std::move(freshCont);
-    if (g_verbose && g_recLog < 200) { ++g_recLog; Output::send(STR("[ISGATE] SRV discover: chests={} camps={} guilds={} inst={}\n"), chests, campsSeen, (int)g_guilds.size(), (int)g_instToCamp.size()); }
+    g_campIdToCamp = std::move(freshCampId);
+    if (g_verbose && g_recLog < 200) { ++g_recLog; Output::send(STR("[ISGATE] SRV discover: chests={} camps={} guilds={} inst={} campIds={}\n"), chests, campsSeen, (int)g_guilds.size(), (int)g_instToCamp.size(), (int)g_campIdToCamp.size()); }
 }
 //! (a) SEH wrapper: the reconcile raw-walks the map-object TMap + every camp's ModuleArray + live container
 //! slots. A pointer freed mid-walk (object destroyed on the game thread) AVs, and WITHOUT a guard that fault left
@@ -624,11 +693,14 @@ static const uintptr_t OFF_PAWN_CAMPCHECK = 0xC08;   // APalPlayerCharacter.Insi
 static const uintptr_t OFF_CHK_CAMPID     = 0xC0;    // UPalInsideBaseCampCheckComponent.NowInsideBaseCampID (FGuid)
 //! server: find the base camp whose OWN id (@0x58) matches the client-supplied camp GUID. No player/connection
 //! reverse-mapping — the requester told us its camp directly.
+//! B3 — uses g_campIdToCamp (rebuilt each reconcile) instead of FindAllOf("PalBaseCampModel") on EVERY client
+//! request. FindAllOf is O(all UObjects); the cache lookup is O(1). The cache is rebuilt every reconcile (~8s)
+//! on this same thread, so a newly-created camp is at most one reconcile cycle stale — the client retries
+//! after CH_MIN_INTERVAL_MS anyway.
 static UObject* srvCampByIdInner(const uint8_t* campGuid16) {
-    std::vector<UObject*> camps; UObjectGlobals::FindAllOf(STR("PalBaseCampModel"), camps);
-    for (UObject* c : camps)
-        if (c && std::memcmp((uint8_t*)c + OFF_CAMP_ID, campGuid16, 16) == 0) return c;
-    return nullptr;
+    wchar_t hex[33]; hexOf(campGuid16, hex);
+    auto it = g_campIdToCamp.find(hex);
+    return (it != g_campIdToCamp.end()) ? it->second : nullptr;
 }
 //! (a) SEH wrapper: a dangling camp pointer mid-FindAllOf (an object freed on the game thread) would AV on the
 //! memcmp read; guard it so a fault yields "not found this tick" instead of wedging hkChRequest.
@@ -836,8 +908,22 @@ static bool chClientTrigger() {
 //! no-op: it fires spuriously (enter+exit paired, and while standing still), and clearing the pool there
 //! dropped the display to 0 mid-build. The pool is refreshed on the next enter + on every menu-open edge.
 static void hkEnterCamp(UnrealScriptFunctionCallableContext& ctx, void*) {
-    (void)ctx;
     if (!isClient()) return;
+    //! OnEnterBaseCamp is a NetMulticast: the server fires it on the entering player's PalBuilderComponent and
+    //! replicates it to ALL clients. Without filtering, every remote player's camp-entry event clears OUR pool
+    //! and triggers a redundant server request — in a 3-player session this turned into a constant RPC storm
+    //! that saturated the reliable channel and stalled ALL game interactions (pal summon, eat, build, etc).
+    //! Filter: only react when the PalBuilderComponent that fired belongs to the LOCAL player.
+    if (ctx.Context) {
+        UObject* eventOwner = ctx.Context->GetOuter();   // PalBuilderComponent -> owning character
+        __try {
+            UObject* ctrl = UObjectGlobals::FindFirstOf(STR("PalPlayerController"));
+            if (ctrl) {
+                UFunction* gp = ctrl->GetFunctionByNameInChain(STR("K2_GetPawn"));
+                if (gp) { struct { UObject* Ret; } pp{}; ctrl->ProcessEvent(gp, &pp); if (pp.Ret && pp.Ret != eventOwner) return; }
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
     g_pool.clear(); g_poolDirty = true; g_needTrigger = true;
     if (g_verbose) Output::send(STR("[ISGATE] CH enter-camp -> flagged\n"));
 }
@@ -897,7 +983,7 @@ static void installChannel() {
 //! new in-game world.
 static UObject* g_lastWorld = nullptr;
 static void resetState() {
-    g_guilds.clear(); g_instToCamp.clear(); g_instToCont.clear(); g_registered.clear();
+    g_guilds.clear(); g_instToCamp.clear(); g_instToCont.clear(); g_campIdToCamp.clear(); g_registered.clear();
     for (UObject* s : g_mintedSlots) if (s) s->ClearRootSet();   // unroot so the old world's minted slots can be GC'd
     g_mintedSlots.clear();
     g_common = nullptr; g_donorCont = nullptr;
@@ -971,7 +1057,7 @@ class ModIntegratedStorageCpp : public CppUserModBase
 public:
     ModIntegratedStorageCpp() : CppUserModBase()
     {
-        ModName = STR("IntegratedStorageCpp"); ModVersion = STR("3.4");   // 3.4: SEH guards on all server paths (reconcile/buildForCamp/campById) so a dangling pointer keeps last-good state instead of wedging everyone; role watchdog (re-verify IsServer ~10s, reset on drift) fixes permanent "only current camp"; always-on error diagnostics
+        ModName = STR("IntegratedStorageCpp"); ModVersion = STR("3.5");   // 3.5: hkEnterCamp local-player filter (fixes multiplayer pool thrashing + RPC storm); srvCampById cache (eliminates per-request FindAllOf); food-box cross-registration (was discovered but never registered -> building couldn't consume cross-camp food)
         ModDescription = STR("Cross-camp build/craft: use any same-guild camp's stored materials at any camp. Server cross-registers guild containers; the remote client displays the guild total via a custom ISI-free transport channel. AOB-signature located (survives game updates).");
         ModAuthors = STR("Sarfflow");
     }

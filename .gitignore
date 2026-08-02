@@ -23,3 +23,7 @@ Thumbs.db
 # Dev scratch
 *.bak
 *.tmp
+
+# UE4SS object dumps (can be 100MB+)
+UE4SS_ObjectDump.txt
+PalBaseCampModuleItemStorage.json
