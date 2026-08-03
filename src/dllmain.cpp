@@ -1115,27 +1115,18 @@ static void ensureReplyUnreliable() {
     UFunction* reqFn   = ctrl->GetFunctionByNameInChain(CH_REQ_FN);   if (!reqFn)   return;
     uint8_t* rb = (uint8_t*)replyFn;
     uint8_t* qb = (uint8_t*)reqFn;
-    //! MemberVariableLayout confirms UFunction::FunctionFlags = 0xB0 on both client and server.
-    //! Read directly at this offset and log the raw values for diagnostics.
-    int off = 0xB0;
-    __try {
-        uint32_t rv = *(uint32_t*)(rb + off);
-        uint32_t qv = *(uint32_t*)(qb + off);
-        Output::send(STR("[ISGATE] L1 diag: off=0xB0 replyFn={} reqFn={} replyFlags={:#x} reqFlags={:#x}\n"),
-            (void*)replyFn, (void*)reqFn, rv, qv);
-        if (rv & 0x00000020u) {   // FUNC_NetReliable
-            *(uint32_t*)(rb + off) = rv & ~0x00000020u;   // clear on reply only
-            g_replyFnFixed = true;
-            g_fnFlagsOff = off;
-            Output::send(STR("[ISGATE] L1: reply RPC unreliable (cleared FUNC_NetReliable at off={:#x}, was {:#x})\n"), off, rv);
-        } else {
-            g_l1Failed = true;
-            Output::send(STR("[ISGATE] L1: FUNC_NetReliable (0x20) not set in replyFlags={:#x} — reply already unreliable or wrong offset\n"), rv);
-        }
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        g_l1Failed = true;
-        Output::send(STR("[ISGATE] L1: AV reading FunctionFlags at off=0xB0 (replyFn={}) — offset mismatch\n"), (void*)replyFn);
+    Output::send(STR("[ISGATE] L1 DUMP replyFn={} reqFn={} — scanning 0x00-0x200 for differing uint32 fields:\n"), (void*)replyFn, (void*)reqFn);
+    for (int off = 0x00; off <= 0x200; off += 4) {
+        __try {
+            uint32_t rv = *(uint32_t*)(rb + off);
+            uint32_t qv = *(uint32_t*)(qb + off);
+            if (rv != qv) {
+                Output::send(STR("[ISGATE] L1 DUMP  off={:#x}  reply={:#x}  req={:#x}\n"), off, rv, qv);
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
     }
+    Output::send(STR("[ISGATE] L1 DUMP complete\n"));
+    g_l1Failed = true;   // one-shot: don't repeat the dump
 }
 
 static void installChannel() {
@@ -1251,7 +1242,7 @@ class ModIntegratedStorageCpp : public CppUserModBase
 public:
     ModIntegratedStorageCpp() : CppUserModBase()
     {
-        ModName = STR("IntegratedStorageCpp"); ModVersion = STR("3.7.2");
+        ModName = STR("IntegratedStorageCpp"); ModVersion = STR("3.7.3");
         ModDescription = STR("Cross-camp build/craft: use any same-guild camp's stored materials at any camp. Server cross-registers guild containers; the remote client displays the guild total via a custom ISI-free transport channel. AOB-signature located (survives game updates).");
         ModAuthors = STR("Sarfflow");
     }
