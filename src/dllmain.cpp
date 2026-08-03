@@ -35,6 +35,7 @@
 #include <utility>
 #include <unordered_map>
 #include <unordered_set>
+#include <map>
 
 #include <Mod/CppUserModBase.hpp>
 #include <DynamicOutput/DynamicOutput.hpp>
@@ -69,7 +70,6 @@ struct RawTArray { uint8_t* data; int32_t num; int32_t max; };
 //   If interaction failure STILL happens -> CH RPC channel is the cause.
 //   If failure STOPS -> injectMinted swap is the cause.
 //#define ISOLATE_NO_SWAP
-#define ISOLATE_NO_SWAP
 
 // ============================================================================
 //  Config (config.txt beside the mod; parsed at load — see loadConfig)
@@ -79,6 +79,10 @@ struct RawTArray { uint8_t* data; int32_t num; int32_t max; };
 static bool     g_verbose      = true;     // verbose [ISGATE] diagnostics
 static uint64_t g_reconcileMs  = 8000;     // authority: discovery-reconcile cadence (min 500)
 static uint64_t g_isiRefreshMs = 1500;     // (reserved; config-compat) remote-client refresh cadence
+//! Layer 1/2/3 transport hardening (see 修复方案.md). All default ON; can be disabled via config.txt.
+static bool     g_chUnreliable   = true;   // L1: clear FUNC_NetReliable on reply RPC
+static bool     g_chDelta        = true;   // L2: send incremental pool updates (IS2|) instead of always-full (IS1|)
+static uint64_t g_chFullSyncMs   = 60000;  // L2: force a full sync at least this often (ms)
 
 // ============================================================================
 //  Struct offsets (ref/sdk/SDK)
@@ -216,6 +220,21 @@ static int      g_consecMiss = 0;                // consecutive unanswered reque
 static int      g_missLogged = 0;                // suppress repeated miss-warning logs until recovery
 static UObject* g_common    = nullptr;           // cached local player's Common container
 static UObject* g_donorCont = nullptr;           // cached donor container (cont5)
+//! Layer 1: FunctionFlags offset (determined at runtime via cross-check, see ensureReplyUnreliable).
+static int  g_fnFlagsOff       = -1;             // byte offset of UFunction::FunctionFlags (-1 = not yet found)
+static bool g_replyFnFixed     = false;          // reply RPC already made unreliable this world
+//! Layer 2: per-client snapshot for delta sync. Keyed by the requester's server-side PlayerController.
+//! The snapshot stores the last-sent pool (as item-name → count) so the server can compute IS2| deltas.
+struct ClientSnap {
+    std::map<std::wstring, int32_t> lastPool;    // last-sent pool (name → count)
+    uint64_t lastFullMs = 0;                      // GetTickCount64 of last FULL (IS1|) sync
+    bool initialized = false;                     // has this client ever received data?
+};
+static std::unordered_map<UObject*, ClientSnap> g_clientSnaps;
+//! Layer 3: deferred reply buffer. hkChRequest stores (controller → payload) here instead of calling
+//! ProcessEvent immediately; on_update flushes it on the next game thread tick. This moves the reply
+//! send out of the net driver's TickDispatch call stack (eliminates re-entrancy risk).
+static std::unordered_map<UObject*, std::wstring> g_pendingReplies;
 //! NOTE: the local PlayerController / PlayerInventoryData are NOT cached — a cached UObject* can dangle when
 //! the game frees/recreates it without a world change, and reading a stale inventory's container array
 //! AV'd in findCommonContainer (crash_2026_07_26). These are all resolved live via FindFirstOf at their call
@@ -708,7 +727,8 @@ static void srvDiscoverReconcile() {
 //! across world changes), builds (guild - that camp) from GROUND-TRUTH container contents, and replies on the
 //! same controller. The client parses the reply into g_pool. Item ids travel as strings (FName indices are
 //! process-local) and are rebuilt with FName(str) — matches the recipe ids exactly.
-static const wchar_t*  CH_SENTINEL     = L"IS1|";     // reply   payload tag: IS1|id:cnt,id:cnt,
+static const wchar_t*  CH_SENTINEL     = L"IS1|";     // reply   payload tag: IS1|id:cnt,id:cnt,  (FULL pool)
+static const wchar_t*  CH_DELTA_TAG    = L"IS2|";     // reply   payload tag: IS2|id:cnt,id:cnt,  (DELTA — changed items only; 0 = removed)
 static const wchar_t*  CH_REQ_SENTINEL = L"ISREQ|";   // request payload tag: ISREQ|<32-hex campGuid>
 //! Payload channel on the PlayerController (the canonical client-owned net actor). The client sends its CURRENT
 //! camp GUID as the request payload, so the server never reverse-maps connection->player->camp (that @0x1E0
@@ -786,18 +806,73 @@ static void srvBuildForCamp(UObject* camp, std::wstring& out) {
         if (g_errLog < 64) { ++g_errLog; Output::send(STR("[ISGATE] CH build: AV guarded -> empty reply\n")); }
     }
 }
+//! Layer 2 — wrap srvBuildForCamp with DELTA encoding. Parses the full IS1| pool into a name→count map,
+//! compares against the per-client snapshot, and emits either:
+//!   IS1|...  (FULL — first request, >60s since last full, or delta disabled)
+//!   IS2|...  (DELTA — only items whose count CHANGED; name:0 means removed)
+//! The snapshot is updated each call so the next delta is relative to this send.
+static void srvBuildReply(UObject* ctrl, UObject* camp, std::wstring& out) {
+    std::wstring full; srvBuildForCamp(camp, full);   // IS1|name:cnt,... (guarded by SEH inside)
+    if (!g_chDelta) { out = full; return; }
+    //! parse IS1| into a sorted map for diffing
+    std::map<std::wstring, int32_t> pool;
+    size_t i = 4;   // skip "IS1|"
+    while (i < full.size()) {
+        size_t comma = full.find(L',', i);
+        if (comma == std::wstring::npos) break;
+        std::wstring tok = full.substr(i, comma - i);
+        i = comma + 1;
+        if (tok.empty()) continue;
+        size_t colon = tok.rfind(L':');
+        if (colon == std::wstring::npos) continue;
+        int32_t cnt = 0; try { cnt = std::stoi(tok.substr(colon + 1)); } catch (...) {}
+        if (cnt > 0) pool[tok.substr(0, colon)] = cnt;
+    }
+    ClientSnap& snap = g_clientSnaps[ctrl];
+    uint64_t now = GetTickCount64();
+    bool sendFull = !snap.initialized || (now - snap.lastFullMs) > g_chFullSyncMs;
+    if (sendFull) {
+        out = full;
+        snap.lastPool = pool;
+        snap.lastFullMs = now;
+        snap.initialized = true;
+        if (g_verbose) Output::send(STR("[ISGATE] L2: FULL sync len={}\n"), (int)out.size());
+    } else {
+        out = CH_DELTA_TAG;
+        int changed = 0;
+        for (auto& p : pool) {
+            auto it = snap.lastPool.find(p.first);
+            int32_t old = (it != snap.lastPool.end()) ? it->second : 0;
+            if (p.second != old) { out += p.first + L":" + std::to_wstring(p.second) + L","; ++changed; }
+        }
+        for (auto& sp : snap.lastPool)
+            if (pool.find(sp.first) == pool.end() && sp.second > 0) { out += sp.first + L":0,"; ++changed; }
+        snap.lastPool = pool;
+        if (g_verbose) Output::send(STR("[ISGATE] L2: DELTA sync changed={} len={}\n"), changed, (int)out.size());
+    }
+}
+//! Layer 3 — send a pending reply via ProcessEvent, guarded by SEH (controller may have disconnected).
+//! Split into inner + wrapper (no C++ destructors in the wrapper) so it compiles under /EHsc.
+static void sendReplyInner(UObject* ctrl, const wchar_t* payload) {
+    UFunction* rf = ctrl->GetFunctionByNameInChain(CH_REPLY_FN); if (!rf) return;
+    struct { FString S; } rp{}; rp.S = FString(payload);
+    ctrl->ProcessEvent(rf, &rp);
+}
+static void sendReplySafe(UObject* ctrl, const std::wstring& payload) {
+    __try { sendReplyInner(ctrl, payload.c_str()); if (g_verbose) Output::send(STR("[ISGATE] CH reply sent len={}\n"), (int)payload.size()); }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        if (g_errLog < 64) { ++g_errLog; Output::send(STR("[ISGATE] CH reply: AV guarded (stale controller) -> skipped\n")); }
+    }
+}
 //! server handler: hooked on Debug_CheatCommand_ToServer. ctx.Context = the requester's (server-side)
 //! PalPlayerController. Read the FString; if it's our request, parse the client-supplied camp GUID, build
-//! (guild - that camp), and reply on the SAME controller via Debug_ReceiveCheatCommand_ToClient (routes to
-//! that one client). A real cheat command (not our sentinel) is ignored. Client's own local echo -> isClient().
+//! (guild - that camp) as a FULL (IS1|) or DELTA (IS2|) payload, and DEFER the reply to on_update (Layer 3)
+//! instead of calling ProcessEvent inside the net driver's TickDispatch. A real cheat command (not our
+//! sentinel) is ignored. Client's own local echo -> isClient().
 //!
-//! CRITICAL: the reply `ctrl->ProcessEvent(rf, &rp)` MUST run under an SEH guard. `ctrl` is the requester's
-//! server-side PlayerController; if that player disconnects mid-request the pointer dangles and the call AVs.
-//! Without a guard the unhandled fault escapes into UE4SS's ProcessEvent hook dispatch and SILENTLY KILLS the
-//! `Debug_CheatCommand_ToServer` hook for the rest of the session — the server keeps ticking (reconcile +
-//! heartbeat survive because they don't go through this hook) but never replies again. This was the root cause
-//! of the 2026-08-02 outage (last reply at 20:48:42, then permanent silence). The split into inner + wrapper
-//! (no C++ objects with destructors in the wrapper) mirrors srvBuildForCamp so it compiles under /EHsc.
+//! SEH guard: `ctrl` is the requester's server-side PlayerController; if that player disconnects mid-request
+//! the pointer dangles. The guard ensures a fault yields "no reply this tick" instead of escaping into
+//! UE4SS's ProcessEvent hook dispatch and permanently killing the channel.
 static void hkChRequestInner(UnrealScriptFunctionCallableContext& ctx, void*) {
     if (isClient()) return;
     UObject* ctrl = ctx.Context; if (!ctrl) return;              // the requester's PalPlayerController (server-side)
@@ -810,12 +885,11 @@ static void hkChRequestInner(UnrealScriptFunctionCallableContext& ctx, void*) {
     if (!hexToGuid(req.substr(6), guid)) { if (g_verbose) Output::send(STR("[ISGATE] CH req: bad guid\n")); return; }
     UObject* camp = srvCampById(guid);
     if (!camp) { if (g_errLog < 64) { ++g_errLog; wchar_t gh[33]; hexOf(guid, gh); Output::send(STR("[ISGATE] CH req: camp not found guid={} (client camp not loaded on server / guid mismatch -> no reply)\n"), gh); } return; }
-    std::wstring payload; srvBuildForCamp(camp, payload);
-    UFunction* rf = ctrl->GetFunctionByNameInChain(CH_REPLY_FN);
-    if (!rf) { if (g_verbose) Output::send(STR("[ISGATE] CH req: no reply fn\n")); return; }
-    struct { FString S; } rp{}; rp.S = FString(payload.c_str());
-    ctrl->ProcessEvent(rf, &rp);
-    if (g_verbose) Output::send(STR("[ISGATE] CH reply sent len={}\n"), (int)payload.size());
+    //! Layer 2+3: build the reply payload (full IS1| or delta IS2|), then DEFER the actual ProcessEvent
+    //! to on_update instead of calling it inside the net driver's TickDispatch call stack. This eliminates
+    //! re-entrancy risk and moves the send out of the inbound-packet handler.
+    std::wstring payload; srvBuildReply(ctrl, camp, payload);
+    g_pendingReplies[ctrl] = std::move(payload);   // L3: store for on_update flush (latest per controller wins)
 }
 //! (a) SEH wrapper: a requester controller freed mid-request (player disconnect / GC) would AV on the reply
 //! ProcessEvent. Guard it so a fault yields "no reply this tick" instead of escaping into UE4SS's hook dispatch
@@ -835,27 +909,49 @@ static void hkChReply(UnrealScriptFunctionCallableContext& ctx, void*) {
     auto& pr = ctx.GetParams<P>();
     if (!pr.S.data || pr.S.num <= 0) return;
     std::wstring str((const wchar_t*)pr.S.data);
-    if (str.rfind(CH_SENTINEL, 0) != 0) return;                  // not ours -> a genuine cheat reply, ignore
+    bool isFull  = str.rfind(CH_SENTINEL, 0)  == 0;              // IS1| = full pool replace
+    bool isDelta = str.rfind(CH_DELTA_TAG, 0) == 0;             // IS2| = incremental update
+    if (!isFull && !isDelta) return;                             // not ours -> a genuine cheat reply, ignore
     g_awaitingReply = false;                                     // our reply arrived -> release the in-flight lock
     if (g_consecMiss > 0 && g_missLogged > 0) Output::send(STR("[ISGATE] CH channel recovered after {} consecutive misses\n"), g_consecMiss);
     g_consecMiss = 0; g_missLogged = 0;                          // channel healthy
-    std::vector<std::pair<FName, int32_t>> np; int items = 0;
-    size_t i = 4;                                                // skip "IS1|"
-    while (i < str.size()) {                                     // parse "name:cnt,name:cnt,"
-        size_t comma = str.find(L',', i);
-        std::wstring tok = str.substr(i, comma == std::wstring::npos ? std::wstring::npos : comma - i);
-        i = (comma == std::wstring::npos) ? str.size() : comma + 1;
-        if (tok.empty()) continue;
-        size_t colon = tok.rfind(L':'); if (colon == std::wstring::npos) continue;
-        std::wstring nm = tok.substr(0, colon);
-        long cnt = 0; try { cnt = std::stol(tok.substr(colon + 1)); } catch (...) { cnt = 0; }
-        if (nm.empty() || cnt <= 0) continue;
-        np.emplace_back(FName(nm.c_str()), (int32_t)cnt); ++items;
+    size_t i = 4;                                                // skip "IS1|" or "IS2|"
+    int items = 0;
+    if (isFull) {
+        //! FULL: replace the entire pool
+        std::vector<std::pair<FName, int32_t>> np;
+        while (i < str.size()) {                                 // parse "name:cnt,name:cnt,"
+            size_t comma = str.find(L',', i);
+            std::wstring tok = str.substr(i, comma == std::wstring::npos ? std::wstring::npos : comma - i);
+            i = (comma == std::wstring::npos) ? str.size() : comma + 1;
+            if (tok.empty()) continue;
+            size_t colon = tok.rfind(L':'); if (colon == std::wstring::npos) continue;
+            std::wstring nm = tok.substr(0, colon);
+            long cnt = 0; try { cnt = std::stol(tok.substr(colon + 1)); } catch (...) { cnt = 0; }
+            if (nm.empty() || cnt <= 0) continue;
+            np.emplace_back(FName(nm.c_str()), (int32_t)cnt); ++items;
+        }
+        g_pool = std::move(np);
+    } else {
+        //! DELTA: apply each changed item to the existing pool (name:0 = remove)
+        while (i < str.size()) {
+            size_t comma = str.find(L',', i);
+            std::wstring tok = str.substr(i, comma == std::wstring::npos ? std::wstring::npos : comma - i);
+            i = (comma == std::wstring::npos) ? str.size() : comma + 1;
+            if (tok.empty()) continue;
+            size_t colon = tok.rfind(L':'); if (colon == std::wstring::npos) continue;
+            std::wstring nm = tok.substr(0, colon);
+            long cnt = 0; try { cnt = std::stol(tok.substr(colon + 1)); } catch (...) { cnt = 0; }
+            if (nm.empty()) continue;
+            FName id(nm.c_str());
+            if (cnt <= 0) { for (auto it = g_pool.begin(); it != g_pool.end(); ++it) if (it->first == id) { g_pool.erase(it); break; } }
+            else { bool f = false; for (auto& p : g_pool) if (p.first == id) { p.second = (int32_t)cnt; f = true; break; } if (!f) g_pool.emplace_back(id, (int32_t)cnt); }
+            ++items;
+        }
     }
-    g_pool = std::move(np);
     g_poolDirty = true;   // re-mint on the next detour tick (needs g_lastWc, set by the detour)
     g_lastFetchOk = GetTickCount64();   // A4: mark a successful fetch for the on_update self-heal refresh
-    if (g_verbose) Output::send(STR("[ISGATE] CH-RECV len={} pool={} Wood={}\n"), (int)str.size(), items, poolGet(FName(STR("Wood"))));
+    if (g_verbose) Output::send(STR("[ISGATE] CH-RECV {} len={} pool={} Wood={}\n"), isFull ? L"FULL" : L"DELTA", (int)str.size(), (int)g_pool.size(), poolGet(FName(STR("Wood"))));
 }
 //! PURE-READ local in-camp test (factored from chClientTrigger's gate). Resolves the local pawn via the
 //! PlayerController's K2_GetPawn, then reads NowInsideBaseCampID's HIGH 8 bytes off the check component
@@ -996,6 +1092,41 @@ static void hkCraftOpen(UnrealScriptFunctionCallableContext& ctx, void*) {
     g_needTrigger = true;
     if (g_verbose) Output::send(STR("[ISGATE] CH menu-open (Craft) -> flagged\n"));
 }
+//! Layer 1 — make the reply RPC (Debug_ReceiveCheatCommand_ToClient) UNRELIABLE. The ~7KB reply (6 UDP
+//! packets) goes through the PlayerController's reliable buffer, which is shared with ALL native RPCs
+//! (summon, teleport, eat…). When our burst coincides with heavy game traffic the buffer saturates and
+//! the ENTIRE channel jams — every interaction freezes for 90s–23min. Clearing FUNC_NetReliable means
+//! our reply bypasses the reliable buffer; a dropped packet is simply retried 3s later by the client.
+//!
+//! The request RPC stays reliable — it's only ~40 bytes (1 packet) and never causes pressure.
+//!
+//! UFunction::FunctionFlags is at an engine-version-dependent offset. We locate it by CROSS-CHECKING
+//! both RPCs at each candidate offset: the reply must have FUNC_Net|FUNC_NetClient (0x04000020) and the
+//! request must have FUNC_Net|FUNC_NetServer (0x04000040). This pair is unique to FunctionFlags.
+static void ensureReplyUnreliable() {
+    if (!g_chUnreliable || g_replyFnFixed) return;
+    UObject* ctrl = UObjectGlobals::FindFirstOf(STR("PalPlayerController")); if (!ctrl) return;
+    UFunction* replyFn = ctrl->GetFunctionByNameInChain(CH_REPLY_FN); if (!replyFn) return;
+    UFunction* reqFn   = ctrl->GetFunctionByNameInChain(CH_REQ_FN);   if (!reqFn)   return;
+    uint8_t* rb = (uint8_t*)replyFn;
+    uint8_t* qb = (uint8_t*)reqFn;
+    for (int off = 0x40; off <= 0x110; off += 4) {
+        __try {
+            uint32_t rv = *(uint32_t*)(rb + off);
+            uint32_t qv = *(uint32_t*)(qb + off);
+            //! reply = Net + NetClient + (likely) NetReliable; request = Net + NetServer + (likely) NetReliable
+            if ((rv & 0x04000020u) == 0x04000020u && (qv & 0x04000040u) == 0x04000040u) {
+                g_fnFlagsOff = off;
+                *(uint32_t*)(rb + off) = rv & ~0x02000000u;   // clear FUNC_NetReliable on reply only
+                g_replyFnFixed = true;
+                Output::send(STR("[ISGATE] L1: reply RPC unreliable (FunctionFlags off={:#x} replyFlags={:#x} reqFlags={:#x})\n"), off, rv, qv);
+                return;
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) { break; }
+    }
+    Output::send(STR("[ISGATE] L1: could not locate FunctionFlags (reply stays reliable)\n"));
+}
+
 static void installChannel() {
     auto noop    = [](UnrealScriptFunctionCallableContext&, void*) {};
     auto trigPre = [](UnrealScriptFunctionCallableContext&, void*) { ++g_hookFires; };   // count EVERY local fire of the request RPC
@@ -1044,6 +1175,9 @@ static void resetState() {
     g_inCampStable = false; g_inCampStreak = 0; g_inCampLastSampleAt = 0;   // A1: re-derive in-camp state in the new world
     g_isSrv = -1; g_isDedi = -1; g_lastWc = nullptr;
     g_errLog = 0;                                                    // fresh per-world budget for always-on error diagnostics
+    g_replyFnFixed = false;                                          // L1: re-apply unreliable flag in the new world
+    g_clientSnaps.clear();                                           // L2: drop per-client pool snapshots
+    g_pendingReplies.clear();                                        // L3: drop deferred replies for disconnected controllers
     Output::send(STR("[ISGATE] world change -> full state reset\n"));
 }
 static void checkWorld(void* anyObj) {
@@ -1090,6 +1224,9 @@ static void loadConfig() {
         if      (key == L"verbose")                             g_verbose      = asBool(g_verbose);
         else if (key == L"reconcile_interval_ms" && num >= 500) g_reconcileMs  = (uint64_t)num;
         else if (key == L"isi_refresh_ms"        && num >= 200) g_isiRefreshMs = (uint64_t)num;
+        else if (key == L"channel_unreliable")                  g_chUnreliable = asBool(g_chUnreliable);
+        else if (key == L"channel_delta")                       g_chDelta      = asBool(g_chDelta);
+        else if (key == L"channel_full_sync_interval" && num >= 5000) g_chFullSyncMs = (uint64_t)num;
     }
 }
 
@@ -1103,7 +1240,7 @@ class ModIntegratedStorageCpp : public CppUserModBase
 public:
     ModIntegratedStorageCpp() : CppUserModBase()
     {
-        ModName = STR("IntegratedStorageCpp"); ModVersion = STR("3.5.2");
+        ModName = STR("IntegratedStorageCpp"); ModVersion = STR("3.6");
         ModDescription = STR("Cross-camp build/craft: use any same-guild camp's stored materials at any camp. Server cross-registers guild containers; the remote client displays the guild total via a custom ISI-free transport channel. AOB-signature located (survives game updates).");
         ModAuthors = STR("Sarfflow");
     }
@@ -1119,10 +1256,6 @@ public:
         loadConfig();
         const uintptr_t base = (uintptr_t)GetModuleHandleW(nullptr);
         Output::send(STR("[ISGATE] === IntegratedStorage {} loaded, base {:#x} ===\n"), ModVersion, base);
-#ifdef ISOLATE_NO_SWAP
-        Output::send(STR("[ISGATE] *** ISOLATION BUILD: injectMinted swap DISABLED — CH RPC only ***\n"));
-#endif
-        Output::send(STR("[ISGATE] config: verbose={} reconcile_ms={}\n"), g_verbose, (int)g_reconcileMs);
         initExecRanges(base);
         Output::send(STR("[ISGATE] exec sections={}\n"), (int)g_exec.size());
         auto maybe = [&](bool en, Target& t, uint64_t cb) {
@@ -1136,6 +1269,11 @@ public:
         //! Transport channel hooks (both ends; role-gated inside the handlers). Server consume is the ~8s
         //! reconcile in on_update. Native ISI is never touched.
         installChannel();
+        //! Layer 1: make the reply RPC unreliable to prevent reliable buffer saturation. Safe to call on
+        //! any role — it only acts if the PalPlayerController and both UFunctions exist (server-side objects).
+        ensureReplyUnreliable();
+        Output::send(STR("[ISGATE] config: verbose={} reconcile_ms={} ch_unreliable={} ch_delta={} ch_full_ms={}\n"),
+            g_verbose, (int)g_reconcileMs, g_chUnreliable, g_chDelta, (int)g_chFullSyncMs);
     }
     auto on_update() -> void override {
         uint64_t now = GetTickCount64();
@@ -1216,6 +1354,12 @@ public:
                 if (chClientTrigger()) { g_needTrigger = false; g_awaitingReply = true; }   // consume + await only if actually sent
             }
             return;
+        }
+        //! AUTHORITY: flush deferred replies (Layer 3) BEFORE reconcile so pending requests get answered
+        //! every frame, not just on reconcile ticks. Each reply is SEH-guarded (controller may disconnect).
+        if (!g_pendingReplies.empty()) {
+            for (auto& kv : g_pendingReplies) sendReplySafe(kv.first, kv.second);
+            g_pendingReplies.clear();
         }
         //! AUTHORITY: ~8s discovery reconcile (guild state + container cross-registration for consume).
         if (g_lastReconcile == 0 || now - g_lastReconcile >= g_reconcileMs) { g_lastReconcile = now; srvDiscoverReconcile(); }
