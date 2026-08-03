@@ -1340,6 +1340,7 @@ public:
                     }
                 } else {
                     g_roleFalseCount = 0;   // agreement — reset streak
+                }
             }
         }
         //! Resolve role first; do nothing until it's known (title menu has no PalPlayerCharacter).
