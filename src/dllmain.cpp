@@ -568,6 +568,7 @@ static UObject* srvStorageOf(UObject* camp) {
 static uint64_t g_lastReconcile = 0;
 static int g_recLog = 0;
 static uint64_t g_lastRoleCheck = 0;   // (b) role-watchdog probe cadence (on_update; role-independent)
+static int g_roleFalseCount = 0;       // consecutive IsServer=false readings before committing to a role reset
 static int g_errLog = 0;               // always-on error/diagnostic counter (NOT gated by g_verbose)
 static void srvDiscoverReconcileInner() {
     UObject* mgr = UObjectGlobals::FindFirstOf(STR("PalMapObjectManager"));
@@ -1193,6 +1194,7 @@ static void resetState() {
     g_l1Failed = false;                                              // L1: allow scan to retry in the new world
     g_clientSnaps.clear();                                           // L2: drop per-client pool snapshots
     g_replyPending = false;                                          // drop deferred reply (controller from old world)
+    g_roleFalseCount = 0;                                            // clear role-watchdog streak
     Output::send(STR("[ISGATE] world change -> full state reset\n"));
 }
 static void checkWorld(void* anyObj) {
@@ -1255,7 +1257,7 @@ class ModIntegratedStorageCpp : public CppUserModBase
 public:
     ModIntegratedStorageCpp() : CppUserModBase()
     {
-        ModName = STR("IntegratedStorageCpp"); ModVersion = STR("3.8");
+        ModName = STR("IntegratedStorageCpp"); ModVersion = STR("3.8.1");
         ModDescription = STR("Cross-camp build/craft: use any same-guild camp's stored materials at any camp. Server cross-registers guild containers; the remote client displays the guild total via a custom ISI-free transport channel. AOB-signature located (survives game updates).");
         ModAuthors = STR("Sarfflow");
     }
@@ -1321,11 +1323,23 @@ public:
                 //! to CLIENT on 2026-08-02 (20:50:49: cached=1 fresh=0 -> full reset). Skip this tick instead;
                 //! the next ~10s probe re-reads on a (likely) stable character.
                 if (faulted) {
-                    if (g_errLog < 64) { ++g_errLog; Output::send(STR("[ISGATE] ROLE watchdog: IsServer probe faulted (transient AV) -> skip this check\n")); }
+                    g_roleFalseCount = 0;
+                    if (g_errLog < 64) { ++g_errLog; Output::send(STR("[ISGATE] ROLE watchdog: IsServer probe faulted (transient AV) -> skip\n")); }
                 } else if (g_isSrv >= 0 && g_isSrv != fresh) {
-                    if (g_errLog < 64) { ++g_errLog; Output::send(STR("[ISGATE] ROLE watchdog: cached={} fresh={} -> full reset\n"), g_isSrv, fresh); }
-                    resetState();   // g_isSrv -> -1 + drop all cached world state; re-derived next tick
-                }
+                    //! Require 3 CONSECUTIVE disagreements (~30s) before committing to a reset. A single
+                    //! IsServer=false on a dedicated server is almost always a transient false reading caused
+                    //! by FindFirstOf returning a PalPlayerCharacter in a replication/loading transition —
+                    //! resetting on the first false positive flips the server to CLIENT and disconnects everyone.
+                    ++g_roleFalseCount;
+                    if (g_roleFalseCount >= 3) {
+                        if (g_errLog < 64) { ++g_errLog; Output::send(STR("[ISGATE] ROLE watchdog: cached={} fresh={} sustained {}x -> full reset\n"), g_isSrv, fresh, g_roleFalseCount); }
+                        g_roleFalseCount = 0;
+                        resetState();
+                    } else {
+                        if (g_errLog < 64) { ++g_errLog; Output::send(STR("[ISGATE] ROLE watchdog: cached={} fresh={} ({} of 3) -> waiting for confirmation\n"), g_isSrv, fresh, g_roleFalseCount); }
+                    }
+                } else {
+                    g_roleFalseCount = 0;   // agreement — reset streak
             }
         }
         //! Resolve role first; do nothing until it's known (title menu has no PalPlayerCharacter).
@@ -1377,7 +1391,17 @@ public:
                 g_replyPending = false;   // stale (player likely disconnected) — discard
             } else {
                 UObject* rc = UObjectGlobals::FindFirstOf(STR("PalPlayerController"));
-                if (rc) { sendReplySafe(rc, g_pendingReply); g_replyPending = false; }
+                if (rc) {
+                    //! RF_PendingKill guard: FindFirstOf can return a controller that is marked for destruction
+                    //! (player disconnecting) but not yet removed from the UObject array. Calling ProcessEvent
+                    //! on such an object corrupts heap memory. ObjectFlags is at offset 0x8; RF_PendingKill = 0x08000000.
+                    bool safe = false;
+                    __try { safe = !(*(uint32_t*)((uint8_t*)rc + 0x8) & 0x08000000u); }
+                    __except (EXCEPTION_EXECUTE_HANDLER) { safe = false; }
+                    if (safe) sendReplySafe(rc, g_pendingReply);
+                    else if (g_errLog < 64) { ++g_errLog; Output::send(STR("[ISGATE] CH reply: controller PendingKill -> skipped\n")); }
+                    g_replyPending = false;
+                }
                 // if rc is null (no player), keep pending and retry next frame
             }
         }
