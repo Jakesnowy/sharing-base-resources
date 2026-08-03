@@ -223,6 +223,7 @@ static UObject* g_donorCont = nullptr;           // cached donor container (cont
 //! Layer 1: FunctionFlags offset (determined at runtime via cross-check, see ensureReplyUnreliable).
 static int  g_fnFlagsOff       = -1;             // byte offset of UFunction::FunctionFlags (-1 = not yet found)
 static bool g_replyFnFixed     = false;          // reply RPC already made unreliable this world
+static bool g_l1Failed         = false;          // L1 scan exhausted all offsets without a match (stop retrying)
 //! Layer 2: per-client snapshot for delta sync. Keyed by the requester's server-side PlayerController.
 //! The snapshot stores the last-sent pool (as item-name → count) so the server can compute IS2| deltas.
 struct ClientSnap {
@@ -1098,11 +1099,17 @@ static void hkCraftOpen(UnrealScriptFunctionCallableContext& ctx, void*) {
 //!
 //! The request RPC stays reliable — it's only ~40 bytes (1 packet) and never causes pressure.
 //!
-//! UFunction::FunctionFlags is at an engine-version-dependent offset. We locate it by CROSS-CHECKING
-//! both RPCs at each candidate offset: the reply must have FUNC_Net|FUNC_NetClient (0x04000020) and the
-//! request must have FUNC_Net|FUNC_NetServer (0x04000040). This pair is unique to FunctionFlags.
+//! UFunction::FunctionFlags is at an engine-version-dependent offset (0xB0 per MemberVariableLayout).
+//! We locate it by CROSS-CHECKING both RPCs at each candidate offset. The reply (_ToClient) must have
+//! FUNC_NetClient (0x04000000) and the request (_ToServer) must have FUNC_NetServer (0x08000000).
+//! This pair of discriminator bits is unique to the FunctionFlags field — no other field would have
+//! FUNC_NetClient in one UFunction and FUNC_NetServer in another at the same offset.
+//!
+//! UE4/5 EFunctionFlags values (ObjectMacros.h):
+//!   FUNC_Net        = 0x00000010    FUNC_NetReliable = 0x00000020
+//!   FUNC_NetClient  = 0x04000000    FUNC_NetServer   = 0x08000000
 static void ensureReplyUnreliable() {
-    if (!g_chUnreliable || g_replyFnFixed) return;
+    if (!g_chUnreliable || g_replyFnFixed || g_l1Failed) return;
     UObject* ctrl = UObjectGlobals::FindFirstOf(STR("PalPlayerController")); if (!ctrl) return;
     UFunction* replyFn = ctrl->GetFunctionByNameInChain(CH_REPLY_FN); if (!replyFn) return;
     UFunction* reqFn   = ctrl->GetFunctionByNameInChain(CH_REQ_FN);   if (!reqFn)   return;
@@ -1112,17 +1119,19 @@ static void ensureReplyUnreliable() {
         __try {
             uint32_t rv = *(uint32_t*)(rb + off);
             uint32_t qv = *(uint32_t*)(qb + off);
-            //! reply = Net + NetClient + (likely) NetReliable; request = Net + NetServer + (likely) NetReliable
-            if ((rv & 0x04000020u) == 0x04000020u && (qv & 0x04000040u) == 0x04000040u) {
+            //! reply (_ToClient) has FUNC_NetClient (0x04000000); request (_ToServer) has FUNC_NetServer (0x08000000).
+            //! Both have FUNC_Net (0x10). This combination uniquely identifies FunctionFlags.
+            if ((rv & 0x04000000u) && (qv & 0x08000000u)) {
                 g_fnFlagsOff = off;
-                *(uint32_t*)(rb + off) = rv & ~0x02000000u;   // clear FUNC_NetReliable on reply only
+                *(uint32_t*)(rb + off) = rv & ~0x00000020u;   // clear FUNC_NetReliable on reply only
                 g_replyFnFixed = true;
-                Output::send(STR("[ISGATE] L1: reply RPC unreliable (FunctionFlags off={:#x} replyFlags={:#x} reqFlags={:#x})\n"), off, rv, qv);
+                Output::send(STR("[ISGATE] L1: reply RPC unreliable (off={:#x} replyFlags={:#x} reqFlags={:#x})\n"), off, rv, qv);
                 return;
             }
-        } __except (EXCEPTION_EXECUTE_HANDLER) { break; }
+        } __except (EXCEPTION_EXECUTE_HANDLER) { continue; }   // skip unreadable offsets, don't abort scan
     }
-    Output::send(STR("[ISGATE] L1: could not locate FunctionFlags (reply stays reliable)\n"));
+    g_l1Failed = true;
+    Output::send(STR("[ISGATE] L1: could not locate FunctionFlags after full scan (reply stays reliable)\n"));
 }
 
 static void installChannel() {
@@ -1174,6 +1183,7 @@ static void resetState() {
     g_isSrv = -1; g_isDedi = -1; g_lastWc = nullptr;
     g_errLog = 0;                                                    // fresh per-world budget for always-on error diagnostics
     g_replyFnFixed = false;                                          // L1: re-apply unreliable flag in the new world
+    g_l1Failed = false;                                              // L1: allow scan to retry in the new world
     g_clientSnaps.clear();                                           // L2: drop per-client pool snapshots
     Output::send(STR("[ISGATE] world change -> full state reset\n"));
 }
@@ -1237,7 +1247,7 @@ class ModIntegratedStorageCpp : public CppUserModBase
 public:
     ModIntegratedStorageCpp() : CppUserModBase()
     {
-        ModName = STR("IntegratedStorageCpp"); ModVersion = STR("3.7");
+        ModName = STR("IntegratedStorageCpp"); ModVersion = STR("3.7.1");
         ModDescription = STR("Cross-camp build/craft: use any same-guild camp's stored materials at any camp. Server cross-registers guild containers; the remote client displays the guild total via a custom ISI-free transport channel. AOB-signature located (survives game updates).");
         ModAuthors = STR("Sarfflow");
     }
