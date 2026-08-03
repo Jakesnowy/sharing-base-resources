@@ -231,10 +231,6 @@ struct ClientSnap {
     bool initialized = false;                     // has this client ever received data?
 };
 static std::unordered_map<UObject*, ClientSnap> g_clientSnaps;
-//! Layer 3: deferred reply buffer. hkChRequest stores (controller → payload) here instead of calling
-//! ProcessEvent immediately; on_update flushes it on the next game thread tick. This moves the reply
-//! send out of the net driver's TickDispatch call stack (eliminates re-entrancy risk).
-static std::unordered_map<UObject*, std::wstring> g_pendingReplies;
 //! NOTE: the local PlayerController / PlayerInventoryData are NOT cached — a cached UObject* can dangle when
 //! the game frees/recreates it without a world change, and reading a stale inventory's container array
 //! AV'd in findCommonContainer (crash_2026_07_26). These are all resolved live via FindFirstOf at their call
@@ -851,7 +847,9 @@ static void srvBuildReply(UObject* ctrl, UObject* camp, std::wstring& out) {
         if (g_verbose) Output::send(STR("[ISGATE] L2: DELTA sync changed={} len={}\n"), changed, (int)out.size());
     }
 }
-//! Layer 3 — send a pending reply via ProcessEvent, guarded by SEH (controller may have disconnected).
+//! SEH-guarded reply send: calls ProcessEvent on the requester's controller. Called IMMEDIATELY from
+//! hkChRequestInner (inside the Debug_CheatCommand_ToServer post-hook), where the controller is guaranteed
+//! alive. The SEH guard is belt-and-suspenders for an extremely narrow tear-down race.
 //! Split into inner + wrapper (no C++ destructors in the wrapper) so it compiles under /EHsc.
 static void sendReplyInner(UObject* ctrl, const wchar_t* payload) {
     UFunction* rf = ctrl->GetFunctionByNameInChain(CH_REPLY_FN); if (!rf) return;
@@ -866,12 +864,12 @@ static void sendReplySafe(UObject* ctrl, const std::wstring& payload) {
 }
 //! server handler: hooked on Debug_CheatCommand_ToServer. ctx.Context = the requester's (server-side)
 //! PalPlayerController. Read the FString; if it's our request, parse the client-supplied camp GUID, build
-//! (guild - that camp) as a FULL (IS1|) or DELTA (IS2|) payload, and DEFER the reply to on_update (Layer 3)
-//! instead of calling ProcessEvent inside the net driver's TickDispatch. A real cheat command (not our
+//! (guild - that camp) as a FULL (IS1|) or DELTA (IS2|) payload, and reply IMMEDIATELY via
+//! Debug_ReceiveCheatCommand_ToClient on the SAME controller (routes to that one client). The controller is
+//! guaranteed alive right now — we are inside its post-hook call stack. A real cheat command (not our
 //! sentinel) is ignored. Client's own local echo -> isClient().
 //!
-//! SEH guard: `ctrl` is the requester's server-side PlayerController; if that player disconnects mid-request
-//! the pointer dangles. The guard ensures a fault yields "no reply this tick" instead of escaping into
+//! SEH guard (hkChRequest wrapper): a fault yields "no reply this tick" instead of escaping into
 //! UE4SS's ProcessEvent hook dispatch and permanently killing the channel.
 static void hkChRequestInner(UnrealScriptFunctionCallableContext& ctx, void*) {
     if (isClient()) return;
@@ -885,11 +883,11 @@ static void hkChRequestInner(UnrealScriptFunctionCallableContext& ctx, void*) {
     if (!hexToGuid(req.substr(6), guid)) { if (g_verbose) Output::send(STR("[ISGATE] CH req: bad guid\n")); return; }
     UObject* camp = srvCampById(guid);
     if (!camp) { if (g_errLog < 64) { ++g_errLog; wchar_t gh[33]; hexOf(guid, gh); Output::send(STR("[ISGATE] CH req: camp not found guid={} (client camp not loaded on server / guid mismatch -> no reply)\n"), gh); } return; }
-    //! Layer 2+3: build the reply payload (full IS1| or delta IS2|), then DEFER the actual ProcessEvent
-    //! to on_update instead of calling it inside the net driver's TickDispatch call stack. This eliminates
-    //! re-entrancy risk and moves the send out of the inbound-packet handler.
+    //! Layer 2: build the reply payload (full IS1| or delta IS2|), then send IMMEDIATELY. The controller is
+    //! guaranteed alive right now — we are inside its Debug_CheatCommand_ToServer post-hook. The SEH guard
+    //! in sendReplySafe (and the outer hkChRequest wrapper) protects against an extremely narrow race.
     std::wstring payload; srvBuildReply(ctrl, camp, payload);
-    g_pendingReplies[ctrl] = std::move(payload);   // L3: store for on_update flush (latest per controller wins)
+    sendReplySafe(ctrl, payload);
 }
 //! (a) SEH wrapper: a requester controller freed mid-request (player disconnect / GC) would AV on the reply
 //! ProcessEvent. Guard it so a fault yields "no reply this tick" instead of escaping into UE4SS's hook dispatch
@@ -1177,7 +1175,6 @@ static void resetState() {
     g_errLog = 0;                                                    // fresh per-world budget for always-on error diagnostics
     g_replyFnFixed = false;                                          // L1: re-apply unreliable flag in the new world
     g_clientSnaps.clear();                                           // L2: drop per-client pool snapshots
-    g_pendingReplies.clear();                                        // L3: drop deferred replies for disconnected controllers
     Output::send(STR("[ISGATE] world change -> full state reset\n"));
 }
 static void checkWorld(void* anyObj) {
@@ -1240,7 +1237,7 @@ class ModIntegratedStorageCpp : public CppUserModBase
 public:
     ModIntegratedStorageCpp() : CppUserModBase()
     {
-        ModName = STR("IntegratedStorageCpp"); ModVersion = STR("3.6");
+        ModName = STR("IntegratedStorageCpp"); ModVersion = STR("3.7");
         ModDescription = STR("Cross-camp build/craft: use any same-guild camp's stored materials at any camp. Server cross-registers guild containers; the remote client displays the guild total via a custom ISI-free transport channel. AOB-signature located (survives game updates).");
         ModAuthors = STR("Sarfflow");
     }
@@ -1269,9 +1266,6 @@ public:
         //! Transport channel hooks (both ends; role-gated inside the handlers). Server consume is the ~8s
         //! reconcile in on_update. Native ISI is never touched.
         installChannel();
-        //! Layer 1: make the reply RPC unreliable to prevent reliable buffer saturation. Safe to call on
-        //! any role — it only acts if the PalPlayerController and both UFunctions exist (server-side objects).
-        ensureReplyUnreliable();
         Output::send(STR("[ISGATE] config: verbose={} reconcile_ms={} ch_unreliable={} ch_delta={} ch_full_ms={}\n"),
             g_verbose, (int)g_reconcileMs, g_chUnreliable, g_chDelta, (int)g_chFullSyncMs);
     }
@@ -1355,12 +1349,10 @@ public:
             }
             return;
         }
-        //! AUTHORITY: flush deferred replies (Layer 3) BEFORE reconcile so pending requests get answered
-        //! every frame, not just on reconcile ticks. Each reply is SEH-guarded (controller may disconnect).
-        if (!g_pendingReplies.empty()) {
-            for (auto& kv : g_pendingReplies) sendReplySafe(kv.first, kv.second);
-            g_pendingReplies.clear();
-        }
+        //! AUTHORITY: Layer 1 — make the reply RPC unreliable to prevent reliable buffer saturation. Deferred
+        //! from startup to here because PalPlayerController doesn't exist at mod-load time. Cheap: no-ops
+        //! after the first successful call (g_replyFnFixed guard); idempotent across world changes.
+        ensureReplyUnreliable();
         //! AUTHORITY: ~8s discovery reconcile (guild state + container cross-registration for consume).
         if (g_lastReconcile == 0 || now - g_lastReconcile >= g_reconcileMs) { g_lastReconcile = now; srvDiscoverReconcile(); }
     }
