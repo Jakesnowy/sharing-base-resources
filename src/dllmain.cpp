@@ -82,7 +82,7 @@ static uint64_t g_isiRefreshMs = 1500;     // (reserved; config-compat) remote-c
 //! Layer 1/2/3 transport hardening (see 修复方案.md). All default ON; can be disabled via config.txt.
 static bool     g_chUnreliable   = true;   // L1: clear FUNC_NetReliable on reply RPC
 static bool     g_chDelta        = true;   // L2: send incremental pool updates (IS2|) instead of always-full (IS1|)
-static uint64_t g_chFullSyncMs   = 60000;  // L2: force a full sync at least this often (ms)
+static uint64_t g_chFullSyncMs   = 300000;  // L2: force a full sync at least this often (ms) — temp 5min while L1 is debugged
 
 // ============================================================================
 //  Struct offsets (ref/sdk/SDK)
@@ -1115,23 +1115,27 @@ static void ensureReplyUnreliable() {
     UFunction* reqFn   = ctrl->GetFunctionByNameInChain(CH_REQ_FN);   if (!reqFn)   return;
     uint8_t* rb = (uint8_t*)replyFn;
     uint8_t* qb = (uint8_t*)reqFn;
-    for (int off = 0x40; off <= 0x110; off += 4) {
-        __try {
-            uint32_t rv = *(uint32_t*)(rb + off);
-            uint32_t qv = *(uint32_t*)(qb + off);
-            //! reply (_ToClient) has FUNC_NetClient (0x04000000); request (_ToServer) has FUNC_NetServer (0x08000000).
-            //! Both have FUNC_Net (0x10). This combination uniquely identifies FunctionFlags.
-            if ((rv & 0x04000000u) && (qv & 0x08000000u)) {
-                g_fnFlagsOff = off;
-                *(uint32_t*)(rb + off) = rv & ~0x00000020u;   // clear FUNC_NetReliable on reply only
-                g_replyFnFixed = true;
-                Output::send(STR("[ISGATE] L1: reply RPC unreliable (off={:#x} replyFlags={:#x} reqFlags={:#x})\n"), off, rv, qv);
-                return;
-            }
-        } __except (EXCEPTION_EXECUTE_HANDLER) { continue; }   // skip unreadable offsets, don't abort scan
+    //! MemberVariableLayout confirms UFunction::FunctionFlags = 0xB0 on both client and server.
+    //! Read directly at this offset and log the raw values for diagnostics.
+    int off = 0xB0;
+    __try {
+        uint32_t rv = *(uint32_t*)(rb + off);
+        uint32_t qv = *(uint32_t*)(qb + off);
+        Output::send(STR("[ISGATE] L1 diag: off=0xB0 replyFn={} reqFn={} replyFlags={:#x} reqFlags={:#x}\n"),
+            (void*)replyFn, (void*)reqFn, rv, qv);
+        if (rv & 0x00000020u) {   // FUNC_NetReliable
+            *(uint32_t*)(rb + off) = rv & ~0x00000020u;   // clear on reply only
+            g_replyFnFixed = true;
+            g_fnFlagsOff = off;
+            Output::send(STR("[ISGATE] L1: reply RPC unreliable (cleared FUNC_NetReliable at off={:#x}, was {:#x})\n"), off, rv);
+        } else {
+            g_l1Failed = true;
+            Output::send(STR("[ISGATE] L1: FUNC_NetReliable (0x20) not set in replyFlags={:#x} — reply already unreliable or wrong offset\n"), rv);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        g_l1Failed = true;
+        Output::send(STR("[ISGATE] L1: AV reading FunctionFlags at off=0xB0 (replyFn={}) — offset mismatch\n"), (void*)replyFn);
     }
-    g_l1Failed = true;
-    Output::send(STR("[ISGATE] L1: could not locate FunctionFlags after full scan (reply stays reliable)\n"));
 }
 
 static void installChannel() {
@@ -1247,7 +1251,7 @@ class ModIntegratedStorageCpp : public CppUserModBase
 public:
     ModIntegratedStorageCpp() : CppUserModBase()
     {
-        ModName = STR("IntegratedStorageCpp"); ModVersion = STR("3.7.1");
+        ModName = STR("IntegratedStorageCpp"); ModVersion = STR("3.7.2");
         ModDescription = STR("Cross-camp build/craft: use any same-guild camp's stored materials at any camp. Server cross-registers guild containers; the remote client displays the guild total via a custom ISI-free transport channel. AOB-signature located (survives game updates).");
         ModAuthors = STR("Sarfflow");
     }
