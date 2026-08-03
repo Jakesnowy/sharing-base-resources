@@ -82,7 +82,7 @@ static uint64_t g_isiRefreshMs = 1500;     // (reserved; config-compat) remote-c
 //! Layer 1/2/3 transport hardening (see 修复方案.md). All default ON; can be disabled via config.txt.
 static bool     g_chUnreliable   = true;   // L1: clear FUNC_NetReliable on reply RPC
 static bool     g_chDelta        = true;   // L2: send incremental pool updates (IS2|) instead of always-full (IS1|)
-static uint64_t g_chFullSyncMs   = 300000;  // L2: force a full sync at least this often (ms) — temp 5min while L1 is debugged
+static uint64_t g_chFullSyncMs   = 3600000;  // L2: full sync interval — 1h (delta-only in practice; initial sync still FULL)
 
 // ============================================================================
 //  Struct offsets (ref/sdk/SDK)
@@ -224,6 +224,14 @@ static UObject* g_donorCont = nullptr;           // cached donor container (cont
 static int  g_fnFlagsOff       = -1;             // byte offset of UFunction::FunctionFlags (-1 = not yet found)
 static bool g_replyFnFixed     = false;          // reply RPC already made unreliable this world
 static bool g_l1Failed         = false;          // L1 scan exhausted all offsets without a match (stop retrying)
+//! Deferred reply: hkChRequest stores the payload here; on_update sends it OUTSIDE the net driver's
+//! TickDispatch call stack. This eliminates re-entrancy — calling ProcessEvent for an outgoing RPC
+//! while inside the incoming-packet handler was corrupting the UChannel's internal state, killing the
+//! channel after ~10–25 min. We store NO raw UObject* (avoids the v3.6 dangling-pointer crash); instead
+//! on_update re-resolves the controller via FindFirstOf. Single-client limitation noted in on_update.
+static std::wstring g_pendingReply;
+static bool         g_replyPending = false;
+static uint64_t     g_replyQueuedAt = 0;
 //! Layer 2: per-client snapshot for delta sync. Keyed by the requester's server-side PlayerController.
 //! The snapshot stores the last-sent pool (as item-name → count) so the server can compute IS2| deltas.
 struct ClientSnap {
@@ -884,11 +892,15 @@ static void hkChRequestInner(UnrealScriptFunctionCallableContext& ctx, void*) {
     if (!hexToGuid(req.substr(6), guid)) { if (g_verbose) Output::send(STR("[ISGATE] CH req: bad guid\n")); return; }
     UObject* camp = srvCampById(guid);
     if (!camp) { if (g_errLog < 64) { ++g_errLog; wchar_t gh[33]; hexOf(guid, gh); Output::send(STR("[ISGATE] CH req: camp not found guid={} (client camp not loaded on server / guid mismatch -> no reply)\n"), gh); } return; }
-    //! Layer 2: build the reply payload (full IS1| or delta IS2|), then send IMMEDIATELY. The controller is
-    //! guaranteed alive right now — we are inside its Debug_CheatCommand_ToServer post-hook. The SEH guard
-    //! in sendReplySafe (and the outer hkChRequest wrapper) protects against an extremely narrow race.
+    //! Layer 2: build the reply payload (full IS1| or delta IS2|), then DEFER to on_update.
+    //! We do NOT call ProcessEvent here — we are inside the net driver's TickDispatch (incoming packet
+    //! handler), and calling an outgoing RPC re-enters the UChannel, corrupting its internal state over
+    //! time. on_update runs on the game thread AFTER TickDispatch, so the reply is sent cleanly.
+    //! No raw UObject* is stored (avoids dangling-pointer crash); on_update re-resolves via FindFirstOf.
     std::wstring payload; srvBuildReply(ctrl, camp, payload);
-    sendReplySafe(ctrl, payload);
+    g_pendingReply = std::move(payload);
+    g_replyPending = true;
+    g_replyQueuedAt = GetTickCount64();
 }
 //! (a) SEH wrapper: a requester controller freed mid-request (player disconnect / GC) would AV on the reply
 //! ProcessEvent. Guard it so a fault yields "no reply this tick" instead of escaping into UE4SS's hook dispatch
@@ -1180,6 +1192,7 @@ static void resetState() {
     g_replyFnFixed = false;                                          // L1: re-apply unreliable flag in the new world
     g_l1Failed = false;                                              // L1: allow scan to retry in the new world
     g_clientSnaps.clear();                                           // L2: drop per-client pool snapshots
+    g_replyPending = false;                                          // drop deferred reply (controller from old world)
     Output::send(STR("[ISGATE] world change -> full state reset\n"));
 }
 static void checkWorld(void* anyObj) {
@@ -1242,7 +1255,7 @@ class ModIntegratedStorageCpp : public CppUserModBase
 public:
     ModIntegratedStorageCpp() : CppUserModBase()
     {
-        ModName = STR("IntegratedStorageCpp"); ModVersion = STR("3.7.3");
+        ModName = STR("IntegratedStorageCpp"); ModVersion = STR("3.8");
         ModDescription = STR("Cross-camp build/craft: use any same-guild camp's stored materials at any camp. Server cross-registers guild containers; the remote client displays the guild total via a custom ISI-free transport channel. AOB-signature located (survives game updates).");
         ModAuthors = STR("Sarfflow");
     }
@@ -1354,10 +1367,20 @@ public:
             }
             return;
         }
-        //! AUTHORITY: Layer 1 — make the reply RPC unreliable to prevent reliable buffer saturation. Deferred
-        //! from startup to here because PalPlayerController doesn't exist at mod-load time. Cheap: no-ops
-        //! after the first successful call (g_replyFnFixed guard); idempotent across world changes.
-        ensureReplyUnreliable();
+        //! AUTHORITY: flush deferred reply (built in hkChRequest, sent here to avoid re-entering the net
+        //! driver's TickDispatch). Re-resolve the controller via FindFirstOf — no stored raw pointer.
+        //! NOTE: with multiple connected clients this replies to the first PalPlayerController found, which
+        //! may not be the original requester. For single-client testing this is correct; multi-client
+        //! support can be added later by storing a NetGUID instead.
+        if (g_replyPending) {
+            if (now - g_replyQueuedAt > 5000) {
+                g_replyPending = false;   // stale (player likely disconnected) — discard
+            } else {
+                UObject* rc = UObjectGlobals::FindFirstOf(STR("PalPlayerController"));
+                if (rc) { sendReplySafe(rc, g_pendingReply); g_replyPending = false; }
+                // if rc is null (no player), keep pending and retry next frame
+            }
+        }
         //! AUTHORITY: ~8s discovery reconcile (guild state + container cross-registration for consume).
         if (g_lastReconcile == 0 || now - g_lastReconcile >= g_reconcileMs) { g_lastReconcile = now; srvDiscoverReconcile(); }
     }
