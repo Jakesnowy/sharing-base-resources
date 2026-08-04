@@ -1122,9 +1122,18 @@ static bool clientInCamp() {
         struct { UObject* Ret; } pp{}; ctrl->ProcessEvent(getPawn, &pp);
         UObject* pawn = pp.Ret; if (!pawn) return (s_cached = false);
         UObject* chk = *(UObject**)((uint8_t*)pawn + OFF_PAWN_CAMPCHECK); if (!chk) return (s_cached = false);
+        //! v4.0.5: use the native IsInsideBaseCamp() predicate (returns bool) instead of reading
+        //! NowInsideBaseCampID's high 8 bytes. The GUID field is cleared by the game while idle in-camp,
+        //! which falsely read "outside" and starved the pool for minutes. IsInsideBaseCamp() is the
+        //! engine's own stable in-camp test. SEH-guarded by the surrounding __try.
+        UFunction* isInside = chk->GetFunctionByNameInChain(STR("IsInsideBaseCamp"));
+        if (isInside) {
+            struct { bool Ret; uint8_t pad[7]; } ir{}; chk->ProcessEvent(isInside, &ir);
+            return (s_cached = ir.Ret);
+        }
+        //! fallback to the GUID read if the function isn't resolved (older build)
         const uint8_t* campGuid = (const uint8_t*)chk + OFF_CHK_CAMPID;
-        uint32_t gHiA = *(const uint32_t*)(campGuid + 0);
-        uint32_t gHiB = *(const uint32_t*)(campGuid + 4);
+        uint32_t gHiA = *(const uint32_t*)(campGuid + 0), gHiB = *(const uint32_t*)(campGuid + 4);
         return (s_cached = !(gHiA == 0 && gHiB == 0));
     } __except (EXCEPTION_EXECUTE_HANDLER) { return (s_cached = false); }
 }
@@ -1392,7 +1401,7 @@ class ModIntegratedStorageCpp : public CppUserModBase
 public:
     ModIntegratedStorageCpp() : CppUserModBase()
     {
-        ModName = STR("IntegratedStorageCpp"); ModVersion = STR("4.0.4");
+        ModName = STR("IntegratedStorageCpp"); ModVersion = STR("4.0.5");
         ModDescription = STR("Cross-camp build/craft: use any same-guild camp's stored materials at any camp. Server cross-registers guild containers; the remote client displays the guild total via a custom ISI-free transport channel. AOB-signature located (survives game updates).");
         ModAuthors = STR("Sarfflow");
     }
