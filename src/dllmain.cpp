@@ -165,13 +165,25 @@ static bool callUtilBool(const CharType* fnName, void* wc, bool* faulted = nullp
 }
 static void ensureRole(void* wc) {
     if (g_isSrv >= 0 || !wc) return;
+    //! Probe IsDedicatedServer FIRST — it is process-fixed (set by -server on the command line) and does
+    //! NOT depend on world/replication state, so it is far more reliable than IsServer right after a reset.
+    g_isDedi = callUtilBool(STR("IsDedicatedServer"), wc) ? 1 : 0;
     bool faulted = false;
     g_isSrv  = callUtilBool(STR("IsServer"), wc, &faulted) ? 1 : 0;
-    g_isDedi = callUtilBool(STR("IsDedicatedServer"), wc) ? 1 : 0;
     //! If the IsServer probe FAULTED (transient AV on a half-destroyed WorldContext), do NOT commit a wrong
     //! "client" (g_isSrv=0) role — leave it unknown and let the next probe retry. Committing 0 here on a
     //! dedicated server would make every server-side guard short-circuit until a world change.
     if (faulted) { g_isSrv = -1; return; }
+    //! A dedicated-server PROCESS is always authority. IsServer can transiently read false right after a
+    //! world change / reset (world mid-replication). Trusting that misread demotes the dedicated server to
+    //! CLIENT and kills ALL server-side work (reconcile/reply stop, calls=0). 2026-08-04 13:38:40 outage:
+    //! a world-change reset re-derived a dedicated server as CLIENT (server=0 dedicated=1 -> CLIENT).
+    //! Override: on a dedicated server, IsServer=false is treated as a transient misread.
+    if (g_isDedi == 1 && g_isSrv == 0) {
+        g_isSrv = 1;
+        Output::send(STR("[ISGATE] ROLE override: IsServer=false on DEDICATED server -> treated as DEDICATED (server)\n"));
+        return;
+    }
     Output::send(STR("[ISGATE] ROLE server={} dedicated={} -> {}\n"), g_isSrv, g_isDedi,
         g_isSrv == 0 ? STR("CLIENT (display)") : (g_isDedi == 1 ? STR("DEDICATED (server)") : STR("HOST/SP (server)")));
 }
@@ -1324,7 +1336,7 @@ class ModIntegratedStorageCpp : public CppUserModBase
 public:
     ModIntegratedStorageCpp() : CppUserModBase()
     {
-        ModName = STR("IntegratedStorageCpp"); ModVersion = STR("3.8.5");
+        ModName = STR("IntegratedStorageCpp"); ModVersion = STR("3.8.6");
         ModDescription = STR("Cross-camp build/craft: use any same-guild camp's stored materials at any camp. Server cross-registers guild containers; the remote client displays the guild total via a custom ISI-free transport channel. AOB-signature located (survives game updates).");
         ModAuthors = STR("Sarfflow");
     }
@@ -1392,7 +1404,7 @@ public:
                 if (faulted) {
                     g_roleFalseCount = 0;
                     if (g_errLog < 64) { ++g_errLog; Output::send(STR("[ISGATE] ROLE watchdog: IsServer probe faulted (transient AV) -> skip\n")); }
-                } else if (g_isSrv >= 0 && g_isSrv != fresh) {
+                } else if (g_isSrv >= 0 && g_isSrv != fresh && !(g_isDedi == 1 && fresh == 0)) {   //! dedicated: IsServer=false is transient, skip
                     //! Require 3 CONSECUTIVE disagreements (~30s) before committing to a reset. A single
                     //! IsServer=false on a dedicated server is almost always a transient false reading caused
                     //! by FindFirstOf returning a PalPlayerCharacter in a replication/loading transition —
