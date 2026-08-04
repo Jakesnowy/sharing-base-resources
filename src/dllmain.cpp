@@ -238,6 +238,7 @@ static int   g_inCampStreak = 0;                 // A1: consecutive disagreeing 
 static uint64_t g_inCampLastSampleAt = 0;        // A1: timestamp of the last streak-advancing sample
 static bool     g_inCampHook       = false;      // v4.0.2: authoritative in-camp state from OnEnter/OnExitBaseCamp hooks (the NowInsideBaseCampID poll reads zero while idle in-camp)
 static bool     g_inCampHookKnown  = false;      // v4.0.2: has an enter/exit hook fired yet? (before that, fall back to the poll)
+static uint64_t g_lastEnterAt      = 0;          // v4.0.4: last OnEnterBaseCamp time - exit within ~3s is suppressed (boundary enter/exit multicast pair)
 static bool g_mintStampDirty = true;             // C1: minted slots need ContainerId/SlotIndex re-stamping
 static int   g_lastStampRealNum = -1;            // C1: cont5 real slot count at last stamp (append-position stability)
 //! Channel back-pressure. Triggering used to piggyback on the collector detour (shared with the ammo HUD),
@@ -1145,7 +1146,10 @@ static bool clientInCampStable() {
     //! g_inCampStable=false and starve the pool for minutes ("AFK in camp -> mod dead"). Enter/exit fire on
     //! real boundary crossings, so trust them once seen; fall back to the debounced poll only before the
     //! first hook event (title screen / very first frame).
-    if (g_inCampHookKnown) return g_inCampHook;
+    //! v4.0.4: OR the hook with the debounced poll. A spurious exit hook must NOT alone clear inCamp while
+    //! the poll still reads inside (that dropped the pool). Either signal "in" is enough; the enter hook
+    //! keeps it sticky through AFK (the poll clears NowInsideBaseCampID while idle).
+    if (g_inCampHookKnown) return g_inCampHook || g_inCampStable;
     return g_inCampStable;
 }
 //! client: read the LOCAL camp GUID off the pawn's InsideBaseCampCheckComponent and return it (outHex).
@@ -1218,7 +1222,8 @@ static void hkEnterCamp(UnrealScriptFunctionCallableContext& ctx, void*) {
         } __except (EXCEPTION_EXECUTE_HANDLER) {}
     }
     g_pool.clear(); g_poolDirty = true; g_needTrigger = true;
-    g_inCampHook = true; g_inCampHookKnown = true;   //! v4.0.2: authoritative in-camp signal (survives AFK — NowInsideBaseCampID clears while idle)
+    g_inCampHook = true; g_inCampHookKnown = true;   //! v4.0.2: authoritative in-camp signal (survives AFK, NowInsideBaseCampID clears while idle)
+    g_lastEnterAt = GetTickCount64();                //! v4.0.4: mark enter time so a same-instant exit (boundary multicast pair) is suppressed
     if (g_verbose) Output::send(STR("[ISGATE] CH enter-camp -> flagged (inCamp=true)\n"));
 }
 static void hkExitCamp(UnrealScriptFunctionCallableContext& ctx, void*) {
@@ -1235,6 +1240,11 @@ static void hkExitCamp(UnrealScriptFunctionCallableContext& ctx, void*) {
             }
         } __except (EXCEPTION_EXECUTE_HANDLER) {}
     }
+    //! v4.0.4: suppress an exit firing right after an enter. OnEnterBaseCamp + OnExitBaseCamp arrive as a
+    //! multicast pair within ~20ms on a boundary crossing; the exit flipped inCamp=false -> injectMinted
+    //! dropped the pool ("out of camp -> dropped stale pool") while the player was actually in camp. Ignore
+    //! an exit within 3s of the last enter; a genuine exit has no recent enter.
+    if (g_lastEnterAt != 0 && (GetTickCount64() - g_lastEnterAt) < 3000) return;
     g_inCampHook = false; g_inCampHookKnown = true;   //! v4.0.2: authoritative out-of-camp signal
     if (g_verbose) Output::send(STR("[ISGATE] CH exit-camp -> inCamp=false\n"));
 }
@@ -1382,7 +1392,7 @@ class ModIntegratedStorageCpp : public CppUserModBase
 public:
     ModIntegratedStorageCpp() : CppUserModBase()
     {
-        ModName = STR("IntegratedStorageCpp"); ModVersion = STR("4.0.3");
+        ModName = STR("IntegratedStorageCpp"); ModVersion = STR("4.0.4");
         ModDescription = STR("Cross-camp build/craft: use any same-guild camp's stored materials at any camp. Server cross-registers guild containers; the remote client displays the guild total via a custom ISI-free transport channel. AOB-signature located (survives game updates).");
         ModAuthors = STR("Sarfflow");
     }
