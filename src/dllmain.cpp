@@ -218,6 +218,7 @@ static uint64_t g_myCalls   = 0;                 // triggers WE sent (chClientTr
 static uint64_t g_hookFires = 0;                 // times the dev trigger UFunction fired locally (== g_myCalls iff nothing else calls it)
 static int      g_consecMiss = 0;                // consecutive unanswered requests (channel health; 0 = last reply arrived)
 static int      g_missLogged = 0;                // suppress repeated miss-warning logs until recovery
+static int      g_replyHookLog = 0;              // diag v3.8.2: cap unconditional "reply hook fired" probes (field logs showed myCalls rising while hookFires stayed 0 — could not tell packet-lost from hook-never-fired)
 static UObject* g_common    = nullptr;           // cached local player's Common container
 static UObject* g_donorCont = nullptr;           // cached donor container (cont5)
 //! Layer 1: FunctionFlags offset (determined at runtime via cross-check, see ensureReplyUnreliable).
@@ -899,6 +900,11 @@ static void hkChRequestInner(UnrealScriptFunctionCallableContext& ctx, void*) {
     //! time. on_update runs on the game thread AFTER TickDispatch, so the reply is sent cleanly.
     //! No raw UObject* is stored (avoids dangling-pointer crash); on_update re-resolves via FindFirstOf.
     std::wstring payload; srvBuildReply(ctrl, camp, payload);
+    //! diag v3.8.2: log every request that reaches the server with its requester controller, the GUID the
+    //! client asked for (reqCamp) and the object srvCampById resolved (camp). If CH-REQ recv keeps arriving
+    //! but the matching "CH reply FLUSH ... sent" never follows -> deferred path starving (candidate A);
+    //! if camp resolution looks wrong -> id-mismatch (candidate B).
+    { wchar_t gh[33]; hexOf(guid, gh); Output::send(STR("[ISGATE] CH-REQ recv ctrl={} reqCamp={} camp={} payload_len={}\n"), (void*)ctrl, gh, (void*)camp, (int)payload.size()); }
     g_pendingReply = std::move(payload);
     g_replyPending = true;
     g_replyQueuedAt = GetTickCount64();
@@ -916,6 +922,12 @@ static void hkChRequest(UnrealScriptFunctionCallableContext& ctx, void* ud) {
 //! client receiver: hooked on Debug_ReceiveCheatCommand_ToClient. If the string carries our sentinel, parse it
 //! into g_pool; otherwise leave it alone. Server's own local echo -> !isClient() guard.
 static void hkChReply(UnrealScriptFunctionCallableContext& ctx, void*) {
+    //! diag v3.8.2: unconditional probe BEFORE any early-return. Field logs showed myCalls rising while
+    //! hookFires stayed 0, so it was impossible to distinguish "reply packet never arrived" from "the
+    //! Debug_ReceiveCheatCommand_ToClient UFunction was never invoked on the client at all". If this line
+    //! NEVER appears in the client log -> reply transport broken at the delivery layer (candidate A).
+    //! If it appears but g_pool still does not update -> payload/sentinel mismatch (candidate B).
+    if (g_replyHookLog < 64) { ++g_replyHookLog; Output::send(STR("[ISGATE] CH-RECV hook fired #{}\n"), g_replyHookLog); }
     if (!isClient()) return;
     struct P { RawTArray S; };                                   // FString Message == TArray<wchar_t> {data,num,max}
     auto& pr = ctx.GetParams<P>();
@@ -1257,7 +1269,7 @@ class ModIntegratedStorageCpp : public CppUserModBase
 public:
     ModIntegratedStorageCpp() : CppUserModBase()
     {
-        ModName = STR("IntegratedStorageCpp"); ModVersion = STR("3.8.1");
+        ModName = STR("IntegratedStorageCpp"); ModVersion = STR("3.8.2");
         ModDescription = STR("Cross-camp build/craft: use any same-guild camp's stored materials at any camp. Server cross-registers guild containers; the remote client displays the guild total via a custom ISI-free transport channel. AOB-signature located (survives game updates).");
         ModAuthors = STR("Sarfflow");
     }
@@ -1388,7 +1400,13 @@ public:
         //! may not be the original requester. For single-client testing this is correct; multi-client
         //! support can be added later by storing a NetGUID instead.
         if (g_replyPending) {
-            if (now - g_replyQueuedAt > 5000) {
+            uint64_t replyAge = now - g_replyQueuedAt;
+            if (replyAge > 5000) {
+                //! diag v3.8.2: a queued reply rotted (>5s) before a flushable PalPlayerController appeared.
+                //! Repeats here => the deferred flush is starved (on_update not progressing, or FindFirstOf
+                //! keeps returning null/PendingKill) — matches the field symptom "server stops sending CH
+                //! reply after ~10min while CH-REQ recv keeps arriving".
+                if (g_errLog < 64) { ++g_errLog; Output::send(STR("[ISGATE] CH reply FLUSH: stale age={}ms -> discarded\n"), (unsigned)replyAge); }
                 g_replyPending = false;   // stale (player likely disconnected) — discard
             } else {
                 UObject* rc = UObjectGlobals::FindFirstOf(STR("PalPlayerController"));
@@ -1399,6 +1417,10 @@ public:
                     bool safe = false;
                     __try { safe = !(*(uint32_t*)((uint8_t*)rc + 0x8) & 0x08000000u); }
                     __except (EXCEPTION_EXECUTE_HANDLER) { safe = false; }
+                    //! diag v3.8.2: surface the deferred-send decision. pendingKill=1 repeatedly while
+                    //! CH-REQ recv keeps arriving => the guard is starving replies (candidate A). NOTE: rc is
+                    //! FindFirstOf's first PalPlayerController, NOT necessarily the original requester.
+                    Output::send(STR("[ISGATE] CH reply FLUSH age={}ms rc={} pendingKill={} -> {}\n"), (unsigned)replyAge, (void*)rc, (int)(safe ? 0 : 1), safe ? STR("sent") : STR("skipped"));
                     if (safe) sendReplySafe(rc, g_pendingReply);
                     else if (g_errLog < 64) { ++g_errLog; Output::send(STR("[ISGATE] CH reply: controller PendingKill -> skipped\n")); }
                     g_replyPending = false;
