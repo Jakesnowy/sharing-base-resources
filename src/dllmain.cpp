@@ -1124,7 +1124,9 @@ static void hkCraftOpen(UnrealScriptFunctionCallableContext& ctx, void*) {
 //!
 //! The request RPC stays reliable — it's only ~40 bytes (1 packet) and never causes pressure.
 //!
-//! UFunction::FunctionFlags is at an engine-version-dependent offset (0xB0 per MemberVariableLayout).
+//! UFunction::FunctionFlags is at an engine-version-dependent offset. NOTE: MemberVariableLayout reports
+//! 0xB0, but on this build reading +0xB0 yields values WITHOUT FUNC_NetClient/NetServer bits (0x1040cc1 /
+//! 0x220cc0 — measured v3.8.3), so 0xB0 is WRONG here. The real offset is located at runtime below.
 //! We locate it by CROSS-CHECKING both RPCs at each candidate offset. The reply (_ToClient) must have
 //! FUNC_NetClient (0x04000000) and the request (_ToServer) must have FUNC_NetServer (0x08000000).
 //! This pair of discriminator bits is unique to the FunctionFlags field — no other field would have
@@ -1133,20 +1135,38 @@ static void hkCraftOpen(UnrealScriptFunctionCallableContext& ctx, void*) {
 //! UE4/5 EFunctionFlags values (ObjectMacros.h):
 //!   FUNC_Net        = 0x00000010    FUNC_NetReliable = 0x00000020
 //!   FUNC_NetClient  = 0x04000000    FUNC_NetServer   = 0x08000000
-static bool clearNetReliable(UFunction* fn) {
-    if (!fn) return false;
+//! Locate the byte offset of UFunction::FunctionFlags by cross-checking. At the FunctionFlags offset the
+//! reply RPC (_ToClient) carries FUNC_NetClient (0x04000000) and the request RPC (_ToServer) carries
+//! FUNC_NetServer (0x08000000). This client/server discriminator pair is unique to the FunctionFlags field,
+//! so the first matching offset IS FunctionFlags. Scans 0x00-0x200 once per world; SEH-guarded.
+static int locateFunctionFlagsOff(UFunction* replyFn, UFunction* reqFn) {
+    uint8_t* rb = (uint8_t*)replyFn;
+    uint8_t* qb = (uint8_t*)reqFn;
+    for (int off = 0x00; off <= 0x200; off += 4) {
+        __try {
+            uint32_t rv = *(uint32_t*)(rb + off);
+            uint32_t qv = *(uint32_t*)(qb + off);
+            if ((rv & 0x04000000u) && (qv & 0x08000000u)) return off;   // reply=NetClient, request=NetServer
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
+    return -1;
+}
+//! Clear FUNC_NetReliable (0x00000020) from a UFunction's FunctionFlags at the given (located) offset.
+//! SEH-guarded; logs before->after so the clear is verifiable in the field log.
+static bool clearNetReliableAt(UFunction* fn, int flagsOff) {
+    if (!fn || flagsOff < 0) return false;
     __try {
-        uint32_t* flags = (uint32_t*)((uint8_t*)fn + 0xB0);   // UFunction::FunctionFlags (PalSchema-confirmed offset)
+        uint32_t* flags = (uint32_t*)((uint8_t*)fn + flagsOff);
         uint32_t before = *flags;
         if (before & 0x00000020u) {                            // FUNC_NetReliable
             *flags = before & ~0x00000020u;
-            Output::send(STR("[ISGATE] L1 clear FUNC_NetReliable @{} : {:#x} -> {:#x}\n"), (void*)fn, before, *flags);
+            Output::send(STR("[ISGATE] L1 clear FUNC_NetReliable @{} off={:#x} : {:#x} -> {:#x}\n"), (void*)fn, flagsOff, before, *flags);
         } else {
-            Output::send(STR("[ISGATE] L1 FUNC_NetReliable already clear @{} : {:#x}\n"), (void*)fn, before);
+            Output::send(STR("[ISGATE] L1 FUNC_NetReliable already clear @{} off={:#x} : {:#x}\n"), (void*)fn, flagsOff, before);
         }
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
-        Output::send(STR("[ISGATE] L1 clear FUNC_NetReliable @{} : AV guarded -> abort\n"), (void*)fn);
+        Output::send(STR("[ISGATE] L1 clear AV guarded @{} off={:#x}\n"), (void*)fn, flagsOff);
         return false;
     }
 }
@@ -1163,14 +1183,21 @@ static void ensureReplyUnreliable() {
     UObject* ctrl = UObjectGlobals::FindFirstOf(STR("PalPlayerController")); if (!ctrl) return;
     UFunction* replyFn = ctrl->GetFunctionByNameInChain(CH_REPLY_FN); if (!replyFn) return;
     UFunction* reqFn   = ctrl->GetFunctionByNameInChain(CH_REQ_FN);   if (!reqFn)   return;
-    bool okR = clearNetReliable(replyFn);
-    bool okQ = clearNetReliable(reqFn);
+    int off = locateFunctionFlagsOff(replyFn, reqFn);
+    if (off < 0) {
+        if (g_errLog < 64) { ++g_errLog; Output::send(STR("[ISGATE] L1 FAIL: FunctionFlags offset not found in 0x00-0x200 (no NetClient/NetServer discriminator) -> CH stays reliable\n")); }
+        g_l1Failed = true;
+        return;
+    }
+    Output::send(STR("[ISGATE] L1 located FunctionFlags @ off={:#x}\n"), off);
+    bool okR = clearNetReliableAt(replyFn, off);
+    bool okQ = clearNetReliableAt(reqFn, off);
     if (okR && okQ) {
         g_replyFnFixed = true;   // both CH RPCs unreliable for this world
-        Output::send(STR("[ISGATE] L1 OK: reply + request made unreliable (FUNC_NetReliable cleared @0xB0)\n"));
+        Output::send(STR("[ISGATE] L1 OK: reply + request made unreliable\n"));
     } else {
         g_l1Failed = true;       // avoid retry loop; CH stays reliable (degraded) this world
-        Output::send(STR("[ISGATE] L1 PARTIAL: reply_ok={} request_ok={} -> keeping reliable\n"), (int)okR, (int)okQ);
+        Output::send(STR("[ISGATE] L1 PARTIAL: reply_ok={} request_ok={}\n"), (int)okR, (int)okQ);
     }
 }
 
@@ -1289,7 +1316,7 @@ class ModIntegratedStorageCpp : public CppUserModBase
 public:
     ModIntegratedStorageCpp() : CppUserModBase()
     {
-        ModName = STR("IntegratedStorageCpp"); ModVersion = STR("3.8.3");
+        ModName = STR("IntegratedStorageCpp"); ModVersion = STR("3.8.4");
         ModDescription = STR("Cross-camp build/craft: use any same-guild camp's stored materials at any camp. Server cross-registers guild containers; the remote client displays the guild total via a custom ISI-free transport channel. AOB-signature located (survives game updates).");
         ModAuthors = STR("Sarfflow");
     }
