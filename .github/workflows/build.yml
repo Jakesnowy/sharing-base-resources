@@ -9,6 +9,7 @@ on:
     branches: [ main, master ]
     paths:
       - 'src/**'
+      - 'dist/**'
       - '.github/workflows/build.yml'
   workflow_dispatch:
 
@@ -123,7 +124,14 @@ jobs:
           New-Item -ItemType Directory -Force -Path "$dist\dlls" | Out-Null
           Copy-Item $dll.FullName "$dist\dlls\main.dll" -Force
           New-Item -ItemType File -Force -Path "$dist\enabled.txt" | Out-Null
-          New-Item -ItemType File -Force -Path "$dist\config.txt" | Out-Null
+          # Use the repo's config.txt (with full Chinese comments) instead of an empty file,
+          # so users get an explained config in the packaged artifact.
+          if (Test-Path "$dist\config.txt") {
+            Write-Host "using repo config.txt (preserved)"
+          } else {
+            Write-Host "WARNING: dist/$env:MOD_NAME/config.txt missing in repo -> creating empty"
+            New-Item -ItemType File -Force -Path "$dist\config.txt" | Out-Null
+          }
           if (Test-Path "$env:MOD_NAME.zip") { Remove-Item "$env:MOD_NAME.zip" -Force }
           Compress-Archive -Path "$dist\*" -DestinationPath "$env:MOD_NAME.zip" -Force
           Write-Host "assembled $dist + $env:MOD_NAME.zip"
