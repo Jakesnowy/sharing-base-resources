@@ -191,8 +191,13 @@ static void ensureRole(void* wc) {
     //! — the reconnect-after-disconnect outage. On a dedicated process the role is process-fixed, so fall
     //! back to authority; non-dedicated can't be guessed, so stay unknown + log + retry next tick.
     if (faulted) {
-        if (g_isDedi == 1) { g_isSrv = 1; if (g_errLog < 64) { ++g_errLog; Output::send(STR("[ISGATE] ROLE faulted IsServer on DEDICATED -> fallback DEDICATED (server)\n")); } }
-        else { g_isSrv = -1; if (g_errLog < 64) { ++g_errLog; Output::send(STR("[ISGATE] ROLE faulted IsServer (g_isDedi={}) -> unknown, retry next tick\n"), g_isDedi); } }
+        if (g_isDedi == 1) {
+            g_isSrv = 1;
+            if (g_errLog < 64) { ++g_errLog; Output::send(STR("[ISGATE] ROLE faulted IsServer on DEDICATED -> fallback DEDICATED (server)\n")); }
+        } else {
+            g_isSrv = -1;
+            if (g_errLog < 64) { ++g_errLog; Output::send(STR("[ISGATE] ROLE faulted IsServer non-dedicated -> unknown retry next tick\n")); }
+        }
         return;
     }
     //! A dedicated-server PROCESS is always authority. IsServer can transiently read false right after a
