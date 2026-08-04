@@ -187,17 +187,11 @@ static void ensureRole(void* wc) {
     //! If the IsServer probe FAULTED (transient AV on a half-destroyed WorldContext), do NOT commit a wrong
     //! "client" (g_isSrv=0) role — leave it unknown and let the next probe retry. Committing 0 here on a
     //! dedicated server would make every server-side guard short-circuit until a world change.
-    //! v4.0.1: but pinning g_isSrv=-1 on a fault starves the ENTIRE mod (on_update returns before HEARTBEAT)
-    //! — the reconnect-after-disconnect outage. On a dedicated process the role is process-fixed, so fall
-    //! back to authority; non-dedicated can't be guessed, so stay unknown + log + retry next tick.
+    //! v4.0.2: pinning g_isSrv=-1 on a fault starves the ENTIRE mod (on_update returns before HEARTBEAT),
+    //! the reconnect-after-disconnect outage. On a dedicated process the role is process-fixed, so fall
+    //! back to authority; non-dedicated cannot be guessed, so stay unknown and retry next tick.
     if (faulted) {
-        if (g_isDedi == 1) {
-            g_isSrv = 1;
-            if (g_errLog < 64) { ++g_errLog; Output::send(STR("[ISGATE] ROLE faulted IsServer on DEDICATED -> fallback DEDICATED (server)\n")); }
-        } else {
-            g_isSrv = -1;
-            if (g_errLog < 64) { ++g_errLog; Output::send(STR("[ISGATE] ROLE faulted IsServer non-dedicated -> unknown retry next tick\n")); }
-        }
+        if (g_isDedi == 1) g_isSrv = 1; else g_isSrv = -1;
         return;
     }
     //! A dedicated-server PROCESS is always authority. IsServer can transiently read false right after a
