@@ -80,7 +80,7 @@ static bool     g_verbose      = true;     // verbose [ISGATE] diagnostics
 static uint64_t g_reconcileMs  = 8000;     // authority: discovery-reconcile cadence (min 500)
 static uint64_t g_isiRefreshMs = 1500;     // (reserved; config-compat) remote-client refresh cadence
 //! Layer 1/2/3 transport hardening (see 修复方案.md). All default ON; can be disabled via config.txt.
-static bool     g_chUnreliable   = true;   // L1: clear FUNC_NetReliable on reply RPC
+static bool     g_chUnreliable   = true;   // L1: clear FUNC_NetReliable on BOTH CH RPCs (reply+request)
 static bool     g_chDelta        = true;   // L2: send incremental pool updates (IS2|) instead of always-full (IS1|)
 static uint64_t g_chFullSyncMs   = 3600000;  // L2: full sync interval — 1h (delta-only in practice; initial sync still FULL)
 
@@ -223,7 +223,7 @@ static UObject* g_common    = nullptr;           // cached local player's Common
 static UObject* g_donorCont = nullptr;           // cached donor container (cont5)
 //! Layer 1: FunctionFlags offset (determined at runtime via cross-check, see ensureReplyUnreliable).
 static int  g_fnFlagsOff       = -1;             // byte offset of UFunction::FunctionFlags (-1 = not yet found)
-static bool g_replyFnFixed     = false;          // reply RPC already made unreliable this world
+static bool g_replyFnFixed     = false;          // BOTH CH RPCs (reply+request) already made unreliable this world
 static bool g_l1Failed         = false;          // L1 scan exhausted all offsets without a match (stop retrying)
 //! Deferred reply: hkChRequest stores the payload here; on_update sends it OUTSIDE the net driver's
 //! TickDispatch call stack. This eliminates re-entrancy — calling ProcessEvent for an outgoing RPC
@@ -1133,25 +1133,44 @@ static void hkCraftOpen(UnrealScriptFunctionCallableContext& ctx, void*) {
 //! UE4/5 EFunctionFlags values (ObjectMacros.h):
 //!   FUNC_Net        = 0x00000010    FUNC_NetReliable = 0x00000020
 //!   FUNC_NetClient  = 0x04000000    FUNC_NetServer   = 0x08000000
+static bool clearNetReliable(UFunction* fn) {
+    if (!fn) return false;
+    __try {
+        uint32_t* flags = (uint32_t*)((uint8_t*)fn + 0xB0);   // UFunction::FunctionFlags (PalSchema-confirmed offset)
+        uint32_t before = *flags;
+        if (before & 0x00000020u) {                            // FUNC_NetReliable
+            *flags = before & ~0x00000020u;
+            Output::send(STR("[ISGATE] L1 clear FUNC_NetReliable @{} : {:#x} -> {:#x}\n"), (void*)fn, before, *flags);
+        } else {
+            Output::send(STR("[ISGATE] L1 FUNC_NetReliable already clear @{} : {:#x}\n"), (void*)fn, before);
+        }
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        Output::send(STR("[ISGATE] L1 clear FUNC_NetReliable @{} : AV guarded -> abort\n"), (void*)fn);
+        return false;
+    }
+}
+//! Layer 1 — clear FUNC_NetReliable on BOTH CH RPCs. v3.6 only meant to do the reply, but v3.7.3 (commit
+//! d936c49) swapped the body for a diagnostic memory dump and never restored the actual clear, so in v3.8.x
+//! BOTH reply AND request were still reliable. The v3.8.2 field repro (12:11:05) proved the cost: heavy
+//! summon + build-menu spam fills the PlayerController's shared reliable buffer with game RPCs, and our
+//! reliable CH request/reply ride the SAME buffer -> the channel jammed and CH transport died both ways while
+//! the game thread kept running. Clearing the bit on BOTH functions pulls our traffic fully out of the
+//! reliable buffer; a dropped packet is retried ~3s later (CH_REPLY_TIMEOUT + A2 self-heal). Idempotent per
+//! world (g_replyFnFixed); retried on every on_update until PlayerController + both UFunctions resolve.
 static void ensureReplyUnreliable() {
     if (!g_chUnreliable || g_replyFnFixed || g_l1Failed) return;
     UObject* ctrl = UObjectGlobals::FindFirstOf(STR("PalPlayerController")); if (!ctrl) return;
     UFunction* replyFn = ctrl->GetFunctionByNameInChain(CH_REPLY_FN); if (!replyFn) return;
     UFunction* reqFn   = ctrl->GetFunctionByNameInChain(CH_REQ_FN);   if (!reqFn)   return;
-    uint8_t* rb = (uint8_t*)replyFn;
-    uint8_t* qb = (uint8_t*)reqFn;
-    Output::send(STR("[ISGATE] L1 DUMP replyFn={} reqFn={} — scanning 0x00-0x200 for differing uint32 fields:\n"), (void*)replyFn, (void*)reqFn);
-    for (int off = 0x00; off <= 0x200; off += 4) {
-        __try {
-            uint32_t rv = *(uint32_t*)(rb + off);
-            uint32_t qv = *(uint32_t*)(qb + off);
-            if (rv != qv) {
-                Output::send(STR("[ISGATE] L1 DUMP  off={:#x}  reply={:#x}  req={:#x}\n"), off, rv, qv);
-            }
-        } __except (EXCEPTION_EXECUTE_HANDLER) {}
-    }
-    Output::send(STR("[ISGATE] L1 DUMP complete\n"));
-    g_l1Failed = true;   // one-shot: don't repeat the dump
+    bool okR = clearNetReliable(replyFn);
+    bool okQ = clearNetReliable(reqFn);
+    if (okR && okQ) {
+        g_replyFnFixed = true;   // both CH RPCs unreliable for this world
+        Output::send(STR("[ISGATE] L1 OK: reply + request made unreliable (FUNC_NetReliable cleared @0xB0)\n"));
+    } else {
+        g_l1Failed = true;       // avoid retry loop; CH stays reliable (degraded) this world
+        Output::send(STR("[ISGATE] L1 PARTIAL: reply_ok={} request_ok={} -> keeping reliable\n"), (int)okR, (int)okQ);
 }
 
 static void installChannel() {
@@ -1269,7 +1288,7 @@ class ModIntegratedStorageCpp : public CppUserModBase
 public:
     ModIntegratedStorageCpp() : CppUserModBase()
     {
-        ModName = STR("IntegratedStorageCpp"); ModVersion = STR("3.8.2");
+        ModName = STR("IntegratedStorageCpp"); ModVersion = STR("3.8.3");
         ModDescription = STR("Cross-camp build/craft: use any same-guild camp's stored materials at any camp. Server cross-registers guild containers; the remote client displays the guild total via a custom ISI-free transport channel. AOB-signature located (survives game updates).");
         ModAuthors = STR("Sarfflow");
     }
@@ -1357,6 +1376,9 @@ public:
         }
         //! Resolve role first; do nothing until it's known (title menu has no PalPlayerCharacter).
         if (g_isSrv < 0) { isClient(); return; }
+        //! Layer 1: clear FUNC_NetReliable on both CH RPCs ASAP (idempotent; no-op until PlayerController
+        //! and both UFunctions resolve). Runs for EVERY role — each side must fix its own UFunction copy.
+        ensureReplyUnreliable();
         //! Periodic heartbeat: always-on (NOT gated by g_verbose or any log cap) so the mod's liveness and
         //! state are visible even after hundreds of CH log lines. Fires every ~30s.
         static uint64_t g_lastHeartbeat = 0;
