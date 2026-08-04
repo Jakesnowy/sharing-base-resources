@@ -187,7 +187,14 @@ static void ensureRole(void* wc) {
     //! If the IsServer probe FAULTED (transient AV on a half-destroyed WorldContext), do NOT commit a wrong
     //! "client" (g_isSrv=0) role — leave it unknown and let the next probe retry. Committing 0 here on a
     //! dedicated server would make every server-side guard short-circuit until a world change.
-    if (faulted) { g_isSrv = -1; return; }
+    //! v4.0.1: but pinning g_isSrv=-1 on a fault starves the ENTIRE mod (on_update returns before HEARTBEAT)
+    //! — the reconnect-after-disconnect outage. On a dedicated process the role is process-fixed, so fall
+    //! back to authority; non-dedicated can't be guessed, so stay unknown + log + retry next tick.
+    if (faulted) {
+        if (g_isDedi == 1) { g_isSrv = 1; if (g_errLog < 64) { ++g_errLog; Output::send(STR("[ISGATE] ROLE faulted IsServer on DEDICATED -> fallback DEDICATED (server)\n")); } }
+        else { g_isSrv = -1; if (g_errLog < 64) { ++g_errLog; Output::send(STR("[ISGATE] ROLE faulted IsServer (g_isDedi={}) -> unknown, retry next tick\n"), g_isDedi); } }
+        return;
+    }
     //! A dedicated-server PROCESS is always authority. IsServer can transiently read false right after a
     //! world change / reset (world mid-replication). Trusting that misread demotes the dedicated server to
     //! CLIENT and kills ALL server-side work (reconcile/reply stop, calls=0). 2026-08-04 13:38:40 outage:
@@ -1277,7 +1284,7 @@ static void resetState() {
     g_consecMiss = 0; g_missLogged = 0;                               // channel health re-derived in new world
     g_lastFetchOk = 0;                                              // A4: no fetch in the new world yet
     g_inCampStable = false; g_inCampStreak = 0; g_inCampLastSampleAt = 0;   // A1: re-derive in-camp state in the new world
-    g_isSrv = -1; g_isDedi = -1; g_lastWc = nullptr;
+    g_isSrv = -1; g_lastWc = nullptr;   //! v4.0.1: keep g_isDedi — dedicated is process-fixed, survives a world change (so ensureRole's fault-fallback can still authorize after a reset)
     g_errLog = 0;                                                    // fresh per-world budget for always-on error diagnostics
     g_roleFalseCount = 0;                                            // clear role-watchdog streak
     //! TCP channel: the connection survives a world change, but every peer's delta snapshot must restart
@@ -1351,7 +1358,7 @@ class ModIntegratedStorageCpp : public CppUserModBase
 public:
     ModIntegratedStorageCpp() : CppUserModBase()
     {
-        ModName = STR("IntegratedStorageCpp"); ModVersion = STR("4.0");
+        ModName = STR("IntegratedStorageCpp"); ModVersion = STR("4.0.1");
         ModDescription = STR("Cross-camp build/craft: use any same-guild camp's stored materials at any camp. Server cross-registers guild containers; the remote client displays the guild total via a custom ISI-free transport channel. AOB-signature located (survives game updates).");
         ModAuthors = STR("Sarfflow");
     }
@@ -1439,7 +1446,14 @@ public:
             }
         }
         //! Resolve role first; do nothing until it's known (title menu has no PalPlayerCharacter).
-        if (g_isSrv < 0) { isClient(); return; }
+        if (g_isSrv < 0) {
+            isClient();
+            //! v4.0.1 diag: role STILL unknown after the ensureRole attempt => the whole mod is idle (the
+            //! HEARTBEAT below never runs). Log every ~10s so a stuck role (faulted probe / missing
+            //! PalPlayerCharacter) is visible — the "reconnect -> mod dead" symptom.
+            if (g_isSrv < 0) { static uint64_t lastUnknownLog = 0; if (now - lastUnknownLog > 10000) { lastUnknownLog = now; Output::send(STR("[ISGATE] ROLE still unknown (g_isSrv=-1) after ensureRole -> mod idle\n")); } }
+            return;
+        }
         //! Bring up the external TCP channel once the role is known (it can't start in on_unreal_init — the
         //! role needs an in-game PalPlayerCharacter). Authority listens; remote client connects; host/SP none.
         if (!g_netStarted) { g_netStarted = true; netStart(); }
