@@ -1171,6 +1171,7 @@ static void ensureReplyUnreliable() {
     } else {
         g_l1Failed = true;       // avoid retry loop; CH stays reliable (degraded) this world
         Output::send(STR("[ISGATE] L1 PARTIAL: reply_ok={} request_ok={} -> keeping reliable\n"), (int)okR, (int)okQ);
+    }
 }
 
 static void installChannel() {
