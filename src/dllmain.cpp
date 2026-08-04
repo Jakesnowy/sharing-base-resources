@@ -1236,7 +1236,7 @@ static void hkEnterCamp(UnrealScriptFunctionCallableContext& ctx, void*) {
             }
         } __except (EXCEPTION_EXECUTE_HANDLER) {}
     }
-    g_pool.clear(); g_poolDirty = true; g_needTrigger = true;
+    g_poolDirty = true; g_needTrigger = true;   //! v4.0.7: do NOT clear g_pool. Same-camp re-entry (walk out then in) emptied g_pool while the server sent a DELTA (snapshot unchanged) -> pool truncated (pool=5/Wood=-1). Server FULL (camp change) / DELTA refresh the pool correctly without us clearing it.
     g_inCampHook = true; g_inCampHookKnown = true;   //! v4.0.2: authoritative in-camp signal (survives AFK, NowInsideBaseCampID clears while idle)
     g_lastEnterAt = GetTickCount64();                //! v4.0.4: mark enter time so a same-instant exit (boundary multicast pair) is suppressed
     if (g_verbose) Output::send(STR("[ISGATE] CH enter-camp -> flagged (inCamp=true)\n"));
@@ -1408,7 +1408,7 @@ class ModIntegratedStorageCpp : public CppUserModBase
 public:
     ModIntegratedStorageCpp() : CppUserModBase()
     {
-        ModName = STR("IntegratedStorageCpp"); ModVersion = STR("4.0.6");
+        ModName = STR("IntegratedStorageCpp"); ModVersion = STR("4.0.7");
         ModDescription = STR("Cross-camp build/craft: use any same-guild camp's stored materials at any camp. Server cross-registers guild containers; the remote client displays the guild total via a custom ISI-free transport channel. AOB-signature located (survives game updates).");
         ModAuthors = STR("Sarfflow");
     }
