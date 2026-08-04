@@ -1183,22 +1183,30 @@ static void ensureReplyUnreliable() {
     UObject* ctrl = UObjectGlobals::FindFirstOf(STR("PalPlayerController")); if (!ctrl) return;
     UFunction* replyFn = ctrl->GetFunctionByNameInChain(CH_REPLY_FN); if (!replyFn) return;
     UFunction* reqFn   = ctrl->GetFunctionByNameInChain(CH_REQ_FN);   if (!reqFn)   return;
-    int off = locateFunctionFlagsOff(replyFn, reqFn);
-    if (off < 0) {
-        if (g_errLog < 64) { ++g_errLog; Output::send(STR("[ISGATE] L1 FAIL: FunctionFlags offset not found in 0x00-0x200 (no NetClient/NetServer discriminator) -> CH stays reliable\n")); }
-        g_l1Failed = true;
-        return;
+    //! v3.8.5 DIAGNOSTIC DUMP — every prior offset guess was WRONG:
+    //!   - MemberVariableLayout's 0xB0 reads 0x1040cc1 (NO net bits) -> not FunctionFlags
+    //!   - v3.8.4 cross-check falsely matched 0x10 (=ClassPrivate): both UFunctions share the same
+    //!     ClassPrivate pointer 0xef6ec340, which coincidentally has BOTH 0x04000000 and 0x08000000,
+    //!     satisfying the loose test on a pointer field.
+    //! So the real FunctionFlags offset is still UNKNOWN. Dump every offset 0x00-0x200 where reply or
+    //! request carries ANY net flag bit; the true offset is where reply shows FUNC_NetClient(0x04000000)
+    //! + FUNC_Net(0x10) + FUNC_NetReliable(0x20) and request shows FUNC_NetServer(0x08000000)+0x10+0x20.
+    //! PURE READ — no write, zero corruption risk. One-shot per world.
+    Output::send(STR("[ISGATE] L1 DUMP replyFn={} reqFn={} — offsets carrying net bits (0x10|0x20|0x04000000|0x08000000):\n"), (void*)replyFn, (void*)reqFn);
+    uint8_t* rb = (uint8_t*)replyFn;
+    uint8_t* qb = (uint8_t*)reqFn;
+    const uint32_t NETBITS = 0x00000010u | 0x00000020u | 0x04000000u | 0x08000000u;
+    for (int off = 0x00; off <= 0x200; off += 4) {
+        __try {
+            uint32_t rv = *(uint32_t*)(rb + off);
+            uint32_t qv = *(uint32_t*)(qb + off);
+            if ((rv & NETBITS) || (qv & NETBITS)) {
+                Output::send(STR("[ISGATE] L1 DUMP  off={:#x}  reply={:#x}  request={:#x}\n"), off, rv, qv);
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
     }
-    Output::send(STR("[ISGATE] L1 located FunctionFlags @ off={:#x}\n"), off);
-    bool okR = clearNetReliableAt(replyFn, off);
-    bool okQ = clearNetReliableAt(reqFn, off);
-    if (okR && okQ) {
-        g_replyFnFixed = true;   // both CH RPCs unreliable for this world
-        Output::send(STR("[ISGATE] L1 OK: reply + request made unreliable\n"));
-    } else {
-        g_l1Failed = true;       // avoid retry loop; CH stays reliable (degraded) this world
-        Output::send(STR("[ISGATE] L1 PARTIAL: reply_ok={} request_ok={}\n"), (int)okR, (int)okQ);
-    }
+    Output::send(STR("[ISGATE] L1 DUMP complete (v3.8.5 = diagnostic only, no clear)\n"));
+    g_l1Failed = true;   // one-shot: dump once, no clear this build
 }
 
 static void installChannel() {
@@ -1316,7 +1324,7 @@ class ModIntegratedStorageCpp : public CppUserModBase
 public:
     ModIntegratedStorageCpp() : CppUserModBase()
     {
-        ModName = STR("IntegratedStorageCpp"); ModVersion = STR("3.8.4");
+        ModName = STR("IntegratedStorageCpp"); ModVersion = STR("3.8.5");
         ModDescription = STR("Cross-camp build/craft: use any same-guild camp's stored materials at any camp. Server cross-registers guild containers; the remote client displays the guild total via a custom ISI-free transport channel. AOB-signature located (survives game updates).");
         ModAuthors = STR("Sarfflow");
     }
