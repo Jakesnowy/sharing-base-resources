@@ -959,6 +959,7 @@ static std::mutex      g_netMu;                 // guards g_peers / g_listenSock
 static std::atomic<bool> g_netRun{false};
 static std::thread     g_netThread;
 static bool            g_netStarted = false;    // netStart() called once after role is known
+static std::atomic<bool> g_cliForceReconnect{false};  // v4.0.6: world-change reset asks the client net thread to reconnect so the server re-sends a FULL (delta snapshot is per-connection)
 static SOCKET          g_listenSock = INVALID_SOCKET;
 static std::vector<NetPeer*> g_peers;           // authority only; owned by the net thread
 static SOCKET          g_cliSock = INVALID_SOCKET;   // remote-client only
@@ -1038,6 +1039,11 @@ static void netClientThread() {
         { std::lock_guard<std::mutex> lk(g_netMu); g_cliSock = s; }
         if (g_verbose) Output::send(STR("[ISGATE] TCP client connected to {}:{}\n"), g_extHost.c_str(), (unsigned)g_extPort);
         while (g_netRun.load()) {
+            //! v4.0.6: a world-change reset cleared g_pool, but the server's delta snapshot is per-connection
+            //! and still thinks it sent the full pool -> it would emit a tiny DELTA that applied to an empty
+            //! pool yields a broken pool (pool=4, Wood=-1 after title->rejoin). Reconnect so the server treats
+            //! us as a new peer (fresh snapshot -> FULL).
+            if (g_cliForceReconnect.load()) { g_cliForceReconnect.store(false); break; }
             std::string outReq;
             { std::lock_guard<std::mutex> lk(g_netMu); if (g_cliHasReq) { outReq = "ISREQ|" + wideToNarrow(g_cliReqHex); g_cliHasReq = false; } }
             if (!outReq.empty()) { outReq.push_back('\n'); if (!sockSendAll(s, outReq)) break; }
@@ -1318,6 +1324,7 @@ static void resetState() {
     g_mintedSlots.clear();
     g_common = nullptr; g_donorCont = nullptr;
     g_pool.clear();
+    g_cliForceReconnect.store(true);   //! v4.0.6: pool wiped -> force TCP reconnect so the server re-sends FULL (delta snapshot is per-connection; a stale DELTA on an empty pool corrupts it)
     g_swapped2 = false; g_swapDonor = nullptr; g_swapBuf.clear();   // drop the append buffer + pinned donor of the old world
     g_mintStampDirty = true; g_lastStampRealNum = -1;               // C1: force a re-stamp in the new world
     g_srvInjecting = false; g_injectDepth = 0;
@@ -1401,7 +1408,7 @@ class ModIntegratedStorageCpp : public CppUserModBase
 public:
     ModIntegratedStorageCpp() : CppUserModBase()
     {
-        ModName = STR("IntegratedStorageCpp"); ModVersion = STR("4.0.5");
+        ModName = STR("IntegratedStorageCpp"); ModVersion = STR("4.0.6");
         ModDescription = STR("Cross-camp build/craft: use any same-guild camp's stored materials at any camp. Server cross-registers guild containers; the remote client displays the guild total via a custom ISI-free transport channel. AOB-signature located (survives game updates).");
         ModAuthors = STR("Sarfflow");
     }
