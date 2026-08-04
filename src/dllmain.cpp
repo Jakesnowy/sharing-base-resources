@@ -951,6 +951,7 @@ struct NetPeer {
     bool hasReply = false;
     bool dead = false;              // net thread marks; removed under lock
     ClientSnap snap;                // L2 delta snapshot, per-connection
+    std::wstring lastCampHex;       // v4.0.3: last requested camp - a change forces FULL re-sync (srvBuildForCamp's baseline differs per camp)
 };
 
 static std::mutex      g_netMu;                 // guards g_peers / g_listenSock / client slots
@@ -1381,7 +1382,7 @@ class ModIntegratedStorageCpp : public CppUserModBase
 public:
     ModIntegratedStorageCpp() : CppUserModBase()
     {
-        ModName = STR("IntegratedStorageCpp"); ModVersion = STR("4.0.2");
+        ModName = STR("IntegratedStorageCpp"); ModVersion = STR("4.0.3");
         ModDescription = STR("Cross-camp build/craft: use any same-guild camp's stored materials at any camp. Server cross-registers guild containers; the remote client displays the guild total via a custom ISI-free transport channel. AOB-signature located (survives game updates).");
         ModAuthors = STR("Sarfflow");
     }
@@ -1534,6 +1535,10 @@ public:
               if (!hexToGuid(hex, guid)) continue;
               UObject* camp = srvCampById(guid);
               if (!camp) { if (g_errLog < 64) { ++g_errLog; Output::send(STR("[ISGATE] CH req: camp not found guid={} (not loaded yet -> no reply; client retries)\n"), hex.c_str()); } continue; }
+              //! v4.0.3: a camp change forces a FULL re-sync. srvBuildForCamp builds (guild - own camp), so
+              //! the baseline differs per camp; a delta against the previous camp's snapshot corrupts the
+              //! client pool (Wood showed 11.4w in camp B vs 6.9w real = camp A items bled in).
+              if (hex != p->lastCampHex) { p->snap.wantFull = true; p->lastCampHex = hex; }
               srvBuildReply(&p->snap, camp, p->reply); p->hasReply = true;
           } }
         //! AUTHORITY: ~8s discovery reconcile (guild state + container cross-registration for consume).
