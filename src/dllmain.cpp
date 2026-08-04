@@ -242,6 +242,8 @@ static uint64_t g_lastFetchOk = 0;               // A4: GetTickCount64 of the la
 static bool g_inCampStable = false;              // A1: debounced "confirmed in camp" (hysteresis over clientInCamp)
 static int   g_inCampStreak = 0;                 // A1: consecutive disagreeing samples toward flipping g_inCampStable
 static uint64_t g_inCampLastSampleAt = 0;        // A1: timestamp of the last streak-advancing sample
+static bool     g_inCampHook       = false;      // v4.0.2: authoritative in-camp state from OnEnter/OnExitBaseCamp hooks (the NowInsideBaseCampID poll reads zero while idle in-camp)
+static bool     g_inCampHookKnown  = false;      // v4.0.2: has an enter/exit hook fired yet? (before that, fall back to the poll)
 static bool g_mintStampDirty = true;             // C1: minted slots need ContainerId/SlotIndex re-stamping
 static int   g_lastStampRealNum = -1;            // C1: cont5 real slot count at last stamp (append-position stability)
 //! Channel back-pressure. Triggering used to piggyback on the collector detour (shared with the ammo HUD),
@@ -1143,6 +1145,12 @@ static bool clientInCampStable() {
         if (raw == g_inCampStable) g_inCampStreak = 0;
         else if (++g_inCampStreak >= 4) { g_inCampStable = raw; g_inCampStreak = 0; }
     }
+    //! v4.0.2: the hook-driven state is AUTHORITATIVE. The raw NowInsideBaseCampID poll reads a zero high
+    //! half while idle in-camp (the field is transiently cleared by the game), which used to flip
+    //! g_inCampStable=false and starve the pool for minutes ("AFK in camp -> mod dead"). Enter/exit fire on
+    //! real boundary crossings, so trust them once seen; fall back to the debounced poll only before the
+    //! first hook event (title screen / very first frame).
+    if (g_inCampHookKnown) return g_inCampHook;
     return g_inCampStable;
 }
 //! client: read the LOCAL camp GUID off the pawn's InsideBaseCampCheckComponent and return it (outHex).
@@ -1215,10 +1223,25 @@ static void hkEnterCamp(UnrealScriptFunctionCallableContext& ctx, void*) {
         } __except (EXCEPTION_EXECUTE_HANDLER) {}
     }
     g_pool.clear(); g_poolDirty = true; g_needTrigger = true;
-    if (g_verbose) Output::send(STR("[ISGATE] CH enter-camp -> flagged\n"));
+    g_inCampHook = true; g_inCampHookKnown = true;   //! v4.0.2: authoritative in-camp signal (survives AFK — NowInsideBaseCampID clears while idle)
+    if (g_verbose) Output::send(STR("[ISGATE] CH enter-camp -> flagged (inCamp=true)\n"));
 }
 static void hkExitCamp(UnrealScriptFunctionCallableContext& ctx, void*) {
-    (void)ctx;   // no-op by design (see note above)
+    if (!isClient()) return;
+    //! Same local-player filter as hkEnterCamp (OnExitBaseCamp is also a NetMulticast; without it every
+    //! remote player's exit would flip OUR state).
+    if (ctx.Context) {
+        UObject* eventOwner = ctx.Context->GetOuterPrivate();
+        __try {
+            UObject* ctrl = UObjectGlobals::FindFirstOf(STR("PalPlayerController"));
+            if (ctrl) {
+                UFunction* gp = ctrl->GetFunctionByNameInChain(STR("K2_GetPawn"));
+                if (gp) { struct { UObject* Ret; } pp{}; ctrl->ProcessEvent(gp, &pp); if (pp.Ret && pp.Ret != eventOwner) return; }
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
+    g_inCampHook = false; g_inCampHookKnown = true;   //! v4.0.2: authoritative out-of-camp signal
+    if (g_verbose) Output::send(STR("[ISGATE] CH exit-camp -> inCamp=false\n"));
 }
 //! client: most overlay menus open through the central dispatcher UPalUserWidget:Push -> covers build, the
 //! ESC/pause menu, and others. We don't care WHICH menu; just flag a fresh pool request. The back-pressure
@@ -1289,6 +1312,7 @@ static void resetState() {
     g_consecMiss = 0; g_missLogged = 0;                               // channel health re-derived in new world
     g_lastFetchOk = 0;                                              // A4: no fetch in the new world yet
     g_inCampStable = false; g_inCampStreak = 0; g_inCampLastSampleAt = 0;   // A1: re-derive in-camp state in the new world
+    g_inCampHook = false; g_inCampHookKnown = false;   //! v4.0.2: re-derive hook-driven in-camp in the new world
     g_isSrv = -1; g_lastWc = nullptr;   //! v4.0.1: keep g_isDedi — dedicated is process-fixed, survives a world change (so ensureRole's fault-fallback can still authorize after a reset)
     g_errLog = 0;                                                    // fresh per-world budget for always-on error diagnostics
     g_roleFalseCount = 0;                                            // clear role-watchdog streak
@@ -1363,7 +1387,7 @@ class ModIntegratedStorageCpp : public CppUserModBase
 public:
     ModIntegratedStorageCpp() : CppUserModBase()
     {
-        ModName = STR("IntegratedStorageCpp"); ModVersion = STR("4.0.1");
+        ModName = STR("IntegratedStorageCpp"); ModVersion = STR("4.0.2");
         ModDescription = STR("Cross-camp build/craft: use any same-guild camp's stored materials at any camp. Server cross-registers guild containers; the remote client displays the guild total via a custom ISI-free transport channel. AOB-signature located (survives game updates).");
         ModAuthors = STR("Sarfflow");
     }
