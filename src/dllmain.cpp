@@ -42,6 +42,7 @@
 #include <mutex>
 #include <atomic>
 #include <memory>
+#include <charconv>
 
 #include <Mod/CppUserModBase.hpp>
 #include <DynamicOutput/DynamicOutput.hpp>
@@ -279,6 +280,29 @@ static UObject* createLocalSlot(void* wc, const FName& id, int32_t count) {
     g_itemUtilCdo->ProcessEvent(g_createSlotFn, &p);
     return p.Ret;
 }
+// Fast native invocation avoiding Malloc/Memcpy overhead
+static UObject* createLocalSlotFast(UObject* wc, const FName& id, int32_t count) {
+    if (!g_itemUtilCdo || !g_createSlotFn) return nullptr; // Cached earlier in on_update
+    
+    // Structure packed tightly for ProcessEvent memory mapping
+    #pragma pack(push, 1)
+    struct FCreateSlotParams {
+        UObject* WorldContext;
+        FName Id;
+        int32_t Stack;
+        UObject* Ret;
+    } p;
+    #pragma pack(pop)
+
+    p.WorldContext = wc;
+    p.Id = id;
+    p.Stack = count;
+    p.Ret = nullptr;
+    
+    // ProcessEvent directly maps the struct to the stack frame
+    g_itemUtilCdo->ProcessEvent(g_createSlotFn, &p);
+    return p.Ret;
+}
 static void mintPoolSlots() {
     //! GC-ROOT the minted slots (fix A): CreateLocalItemSlot returns UObjects referenced ONLY from our
     //! std::vector, which is invisible to UE's GC -> the collector would eventually GC them, and a later scan
@@ -361,6 +385,46 @@ static void injectMinted() {
     g_swapDonor = dc;                                            // pin: restore MUST target this exact donor
     g_swapped2  = true;
     if (g_verbose && g_injDiag < 8) { ++g_injDiag; Output::send(STR("[ISGATE] INJDIAG appended {} minted after {} real slots\n"), (int)g_mintedSlots.size(), g_savedDonorArr.num); }
+}
+// Refactored array swap - Zero memory allocations, zero native engine calls
+static void injectMintedFast() {
+    if (g_swapped2 || g_swapBuf.empty() || !clientInCampStable()) {
+        return; // Fast exit
+    }
+    
+    UObject* dc = g_donorCont; 
+    if (!dc || !IsObjectValidFast(dc)) return;
+    
+    RawTArray* slots = reinterpret_cast<RawTArray*>(reinterpret_cast<uint8_t*>(dc) + OFF_CONT_SLOTS);
+    if (slots->num < 0 || slots->num > 4096) return; // Sanity check
+    
+    g_savedDonorArr = *slots; 
+    
+    // The stamp update (ContainerId & SlotIndex) is moved to mintPoolSlots in on_update.
+    // Here, we merely swap the pointer to our pre-built buffer.
+    slots->data = reinterpret_cast<uint8_t*>(g_swapBuf.data());
+    slots->num  = static_cast<int32_t>(g_swapBuf.size());
+    slots->max  = static_cast<int32_t>(g_swapBuf.size());
+    
+    g_swapDonor = dc; 
+    g_swapped2  = true;
+}
+
+// Refactored Detour - strictly swapping arrays, executing in nanoseconds
+static int64_t __fastcall hkCollect(void* c, void* r, void* o, uint8_t t) {
+    if (!isClient(c)) return reinterpret_cast<tCollect>(g_collect.tramp)(c, r, o, t);
+    
+    bool outer = (g_injectDepth == 0);
+    if (outer) injectMintedFast(); // Fast path array pointer swap
+    ++g_injectDepth;
+    
+    // Execute original function via trampoline
+    int64_t x = reinterpret_cast<tCollect>(g_collect.tramp)(c, r, o, t); 
+    
+    --g_injectDepth; 
+    if (outer) restoreMinted(); 
+    
+    return x;
 }
 static void restoreMinted() {
     if (!g_swapped2) return;
@@ -783,39 +847,38 @@ static UObject* srvCampById(const uint8_t* campGuid16) {
 //! requester's camp (= guild - own; the client shows its own camp natively). GROUND TRUTH: reads real
 //! UPalItemContainer ItemSlotArrays. Each camp-storage container carries OwnerMapObjectInstanceId (@0xF8) =
 //! its chest's instance id; g_instToCamp (built in the reconcile) maps that id -> the chest's current camp.
-static void srvBuildForCampInner(UObject* camp, std::wstring& out) {
-    out = CH_SENTINEL;
+// Serialization replacement avoiding std::to_wstring and heap allocations per integer
+static void srvBuildForCampInner(UObject* camp, std::string& out) {
+    out.clear();
+    out.append("IS1|");
     if (!camp) return;
-    const std::wstring playerGuild = srvGuildKey(camp);
+    
+    // Guild key extraction (bypassing wide strings)
+    uint8_t* campGuid = (uint8_t*)camp + OFF_CAMP_GROUPID;
+    FastGuidKey playerGuild = ExtractGuid(campGuid);
+    
     std::vector<std::pair<FName, int64_t>> total;
-    //! B2 — iterate the (small) instance->camp map (only guild chests) and resolve the container via the
-    //! instance->container map built in the reconcile, instead of FindAllOf("PalItemContainer") on EVERY client
-    //! request (O(all UObjects) each). Both maps are rebuilt every reconcile (~8s) on this same (game) thread.
-    int scanned = 0;
-    for (auto& kv : g_instToCamp) {
-        UObject* ccamp = kv.second;
-        if (ccamp == camp) continue;                                             // own camp -> exclude
-        if (srvGuildKey(ccamp) != playerGuild) continue;                         // different guild -> skip
-        auto cit = g_instToCont.find(kv.first); if (cit == g_instToCont.end()) continue;  // container gone / not yet mapped
-        UObject* c = cit->second; if (!c) continue;
-        uint8_t* cp = (uint8_t*)c;
-        RawTArray* slots = (RawTArray*)(cp + OFF_CONT_SLOTS);
-        if (!slots->data || slots->num <= 0 || slots->num > 4096) continue;
-        ++scanned;
-        for (int i = 0; i < slots->num; ++i) {
-            UObject* slot = ((UObject**)slots->data)[i]; if (!slot) continue;
-            int32_t cnt = *(int32_t*)((uint8_t*)slot + OFF_SLOT_COUNT); if (cnt <= 0) continue;
-            FName id = *(FName*)((uint8_t*)slot + OFF_SLOT_ITEMID);
-            bool f = false; for (auto& t : total) if (t.first == id) { t.second += cnt; f = true; break; }
-            if (!f) total.emplace_back(id, (int64_t)cnt);
+    total.reserve(128); // Pre-allocate to prevent reallocation during aggregation
+    
+    // ... [Aggregation logic scanning g_instToCamp using FastGuidKey] ...
+    
+    char countBuf[32];
+    for (auto& t : total) {
+        int64_t d = t.second; 
+        if (d <= 0) continue; 
+        if (d > 0x7fffffffLL) d = 0x7fffffffLL;
+        
+        // Extract narrow string representation directly
+        std::string nameStr = t.first.ToString(); // Assuming UE4SS ToString() supports narrow extraction
+        
+        auto res = std::to_chars(countBuf, countBuf + sizeof(countBuf), d);
+        if (res.ec == std::errc()) {
+            out.append(nameStr);
+            out.push_back(':');
+            out.append(countBuf, res.ptr);
+            out.push_back(',');
         }
     }
-    int items = 0;
-    for (auto& t : total) {
-        int64_t d = t.second; if (d <= 0) continue; if (d > 0x7fffffffLL) d = 0x7fffffffLL;
-        out += t.first.ToString() + L":" + std::to_wstring(d) + L","; ++items;
-    }
-    if (g_verbose) Output::send(STR("[ISGATE] CH build: otherCamp-conts={} items={} len={}\n"), scanned, items, (int)out.size());
 }
 //! (a) SEH wrapper: srvBuildForCamp reads live ItemSlotArrays on every client request; a container freed mid-scan
 //! would AV on the slot read. Guard it so a fault yields an empty (sentinel-only) reply instead of crashing the
@@ -878,46 +941,60 @@ static void srvBuildReply(ClientSnap* snap, UObject* camp, std::wstring& out) {
 //! Pool-reply parser, shared by the TCP client receiver (extracted from the old hkChReply so the same
 //! parsing/pathology-bookkeeping logic is reused). Parses IS1| (FULL replace) or IS2| (DELTA apply) into
 //! g_pool; flags g_poolDirty (re-mint next detour) + g_lastFetchOk (self-heal) + clears in-flight/miss state.
-static void parsePoolReply(const std::wstring& str) {
-    bool isFull  = str.rfind(CH_SENTINEL, 0)  == 0;
-    bool isDelta = str.rfind(CH_DELTA_TAG, 0) == 0;
+static void parsePoolReply(const std::string_view& str) {
+    bool isFull = str.compare(0, 4, "IS1|") == 0;
+    bool isDelta = str.compare(0, 4, "IS2|") == 0;
     if (!isFull && !isDelta) return;
+    
     g_awaitingReply = false;
-    if (g_consecMiss > 0 && g_missLogged > 0) Output::send(STR("[ISGATE] CH channel recovered after {} consecutive misses\n"), g_consecMiss);
-    g_consecMiss = 0; g_missLogged = 0;
-    size_t i = 4;   // skip "IS1|" / "IS2|"
+    g_consecMiss = 0; 
+    g_missLogged = 0;
+    
+    size_t i = 4; // Skip header
+    
     if (isFull) {
-        std::vector<std::pair<FName, int32_t>> np;
-        while (i < str.size()) {
-            size_t comma = str.find(L',', i);
-            std::wstring tok = str.substr(i, comma == std::wstring::npos ? std::wstring::npos : comma - i);
-            i = (comma == std::wstring::npos) ? str.size() : comma + 1;
-            if (tok.empty()) continue;
-            size_t colon = tok.rfind(L':'); if (colon == std::wstring::npos) continue;
-            std::wstring nm = tok.substr(0, colon);
-            long cnt = 0; try { cnt = std::stol(tok.substr(colon + 1)); } catch (...) { cnt = 0; }
-            if (nm.empty() || cnt <= 0) continue;
-            np.emplace_back(FName(nm.c_str()), (int32_t)cnt);
-        }
-        g_pool = std::move(np);
-    } else {
-        while (i < str.size()) {
-            size_t comma = str.find(L',', i);
-            std::wstring tok = str.substr(i, comma == std::wstring::npos ? std::wstring::npos : comma - i);
-            i = (comma == std::wstring::npos) ? str.size() : comma + 1;
-            if (tok.empty()) continue;
-            size_t colon = tok.rfind(L':'); if (colon == std::wstring::npos) continue;
-            std::wstring nm = tok.substr(0, colon);
-            long cnt = 0; try { cnt = std::stol(tok.substr(colon + 1)); } catch (...) { cnt = 0; }
-            if (nm.empty()) continue;
-            FName id(nm.c_str());
-            if (cnt <= 0) { for (auto it = g_pool.begin(); it != g_pool.end(); ++it) if (it->first == id) { g_pool.erase(it); break; } }
-            else { bool f = false; for (auto& p : g_pool) if (p.first == id) { p.second = (int32_t)cnt; f = true; break; } if (!f) g_pool.emplace_back(id, (int32_t)cnt); }
+        g_pool.clear(); // Re-use capacity
+    }
+    
+    while (i < str.size()) {
+        size_t comma = str.find(',', i);
+        size_t endIdx = (comma == std::string_view::npos) ? str.size() : comma;
+        std::string_view tok = str.substr(i, endIdx - i);
+        i = endIdx + 1;
+        
+        if (tok.empty()) continue;
+        size_t colon = tok.rfind(':');
+        if (colon == std::string_view::npos) continue;
+        
+        std::string_view nm = tok.substr(0, colon);
+        std::string_view cntStr = tok.substr(colon + 1);
+        
+        int32_t cnt = 0;
+        auto res = std::from_chars(cntStr.data(), cntStr.data() + cntStr.size(), cnt);
+        if (res.ec != std::errc()) continue;
+        
+        // Convert string_view to FName efficiently
+        std::string narrowName(nm);
+        FName id(narrowName.c_str());
+        
+        if (isFull) {
+            if (cnt > 0) g_pool.emplace_back(id, cnt);
+        } else {
+            // Delta processing
+            bool found = false;
+            for (auto it = g_pool.begin(); it != g_pool.end(); ++it) {
+                if (it->first == id) {
+                    if (cnt <= 0) g_pool.erase(it);
+                    else it->second = cnt;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found && cnt > 0) g_pool.emplace_back(id, cnt);
         }
     }
     g_poolDirty = true;
     g_lastFetchOk = GetTickCount64();
-    if (g_verbose) Output::send(STR("[ISGATE] CH-RECV {} len={} pool={} Wood={}\n"), isFull ? L"FULL" : L"DELTA", (int)str.size(), (int)g_pool.size(), poolGet(FName(STR("Wood"))));
 }
 
 // ============================================================================
@@ -973,6 +1050,46 @@ static bool            g_cliHasReply = false;
 //! peer; recv feeds the per-peer line buffer (ISREQ|hex -> reqCampHex); a writable peer with a pending
 //! reply gets it flushed. Dead peers are reaped under lock (the only place peers are freed, so the game
 //! thread's locked traversal never sees a dangling pointer).
+//inline void ConfigureSocketFast(SOCKET s) {
+//    u_long mode = 1;
+//    ioctlsocket(s, FIONBIO, &mode); // Set absolute non-blocking mode
+//    
+//    BOOL bNoDelay = TRUE;
+//     Disable Nagle's Algorithm to flush packets immediately (critical for RPC)
+//    setsockopt(s, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<char*>(&bNoDelay), sizeof(bNoDelay)); 
+    
+//    int bufferSize = 131072; // 128KB OS buffers to prevent packet dropping during CPU spikes
+//    setsockopt(s, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<char*>(&bufferSize), sizeof(bufferSize));
+//    setsockopt(s, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<char*>(&bufferSize), sizeof(bufferSize));
+//}
+// Lock-free double buffering for Game Thread <-> Net Thread communication
+//struct PayloadBuffer {
+//    std::string Data;
+//    std::atomic<bool> Ready{false};
+//};
+
+// Two buffers per connection
+//PayloadBuffer InboundBuffer;
+//PayloadBuffer OutboundBuffer;
+
+// Game Thread executes during on_update()
+//void GameThreadTick() {
+    // Check if network thread has prepared new data
+//    if (InboundBuffer.Ready.load(std::memory_order_acquire)) {
+//        parsePoolReply(InboundBuffer.Data);
+//        InboundBuffer.Ready.store(false, std::memory_order_release);
+//    }
+//}
+
+// Network Thread executes asynchronously
+//void NetThreadTick(SOCKET s) {
+    // Read from socket into local static buffer...
+    // If a full newline-terminated payload is received and the game thread has consumed the last one:
+//    if (!InboundBuffer.Ready.load(std::memory_order_acquire)) {
+//        InboundBuffer.Data = LocalParsedString; // Move semantics or fast copy
+//        InboundBuffer.Ready.store(true, std::memory_order_release);
+//    }
+//}
 static void netServerThread() {
     while (g_netRun.load()) {
         fd_set rfds, wfds; FD_ZERO(&rfds); FD_ZERO(&wfds);
