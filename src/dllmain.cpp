@@ -203,7 +203,8 @@ static void mintPoolSlots() {
     g_mintedSlots.reserve(g_pool.size());
     for (auto& kv : g_pool) {
         if (kv.second <= 0) continue;
-        std::string nm = kv.first.ToString();
+        RC::StringType wNm = kv.first.ToString();
+        std::string nm(wNm.begin(), wNm.end());
         if (nm.empty() || nm == "None") continue;
         UObject* s = createLocalSlotFast(g_lastWc, kv.first, kv.second);
         if (s) { s->SetRootSet(); g_mintedSlots.push_back(s); }
@@ -573,7 +574,8 @@ static void srvBuildForCamp(UObject* camp, std::string& out) {
     char countBuf[32];
     for (auto& t : total) {
         int64_t d = t.second; if (d <= 0) continue; if (d > 0x7fffffffLL) d = 0x7fffffffLL;
-        std::string nameStr = t.first.ToString();
+        RC::StringType wnameStr = t.first.ToString();
+        std::string nameStr(wnameStr.begin(), wnameStr.end());
         auto res = std::to_chars(countBuf, countBuf + sizeof(countBuf), d);
         if (res.ec == std::errc()) {
             out.append(nameStr);
@@ -649,7 +651,8 @@ static void parsePoolReply(const std::string_view& str) {
         auto res = std::from_chars(cntStr.data(), cntStr.data() + cntStr.size(), cnt);
         if (res.ec != std::errc() || nm.empty()) continue;
         
-        FName id(std::string(nm).c_str());
+        std::wstring wId(nm.begin(), nm.end());
+        FName id(wId.c_str());
         
         if (isFull) {
             if (cnt > 0) g_pool.emplace_back(id, cnt);
