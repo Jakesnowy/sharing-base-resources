@@ -1110,18 +1110,18 @@ static void loadConfig() {
         if (key == "verbose") g_verbose = (val == "true" || val == "1");
         else if (key == "reconcile_interval_ms") {
             uint64_t v = 0;
-            if (std::to_chars(val.data(), val.data() + val.size(), v).ec == std::errc() && v >= 500) g_reconcileMs = v;
+            if (std::from_chars(val.data(), val.data() + val.size(), v).ec == std::errc() && v >= 500) g_reconcileMs = v;
         }
         else if (key == "external_channel") g_extEnabled = (val == "true" || val == "1");
         else if (key == "external_port") {
             uint16_t v = 0;
-            if (std::to_chars(val.data(), val.data() + val.size(), v).ec == std::errc()) g_extPort = (uint16_t)v;
+            if (std::from_chars(val.data(), val.data() + val.size(), v).ec == std::errc()) g_extPort = (uint16_t)v;
         }
         else if (key == "external_server_host") g_extHost = std::string(val);
         else if (key == "channel_delta") g_chDelta = (val == "true" || val == "1");
         else if (key == "channel_full_sync_interval") {
             uint64_t v = 0;
-            if (std::to_chars(val.data(), val.data() + val.size(), v).ec == std::errc() && v >= 5000) g_chFullSyncMs = v;
+            if (std::from_chars(val.data(), val.data() + val.size(), v).ec == std::errc() && v >= 5000) g_chFullSyncMs = v;
         }
     }
 }
