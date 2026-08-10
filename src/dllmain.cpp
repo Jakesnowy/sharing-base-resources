@@ -14,8 +14,10 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <thread>
+#include <mutex>
 #include <atomic>
 #include <array>
+#include <cctype>
 
 #include <Mod/CppUserModBase.hpp>
 #include <DynamicOutput/DynamicOutput.hpp>
@@ -67,7 +69,7 @@ static const uintptr_t OFF_CONT_MGR_MAP = 0x98;
 static const uintptr_t OFF_PAWN_CAMPCHECK = 0xC08;
 static const uintptr_t OFF_CHK_CAMPID = 0xC0;
 
-struct alignas(16) FastGuidKey {
+struct FastGuidKey {
     uint64_t A; uint64_t B;
     inline bool operator==(const FastGuidKey& Other) const { return A == Other.A && B == Other.B; }
 };
@@ -81,7 +83,9 @@ struct FastGuidHash {
 };
 
 inline FastGuidKey ExtractGuid(const uint8_t* memoryAddress) {
-    return *reinterpret_cast<const FastGuidKey*>(memoryAddress);
+    FastGuidKey key;
+    std::memcpy(&key, memoryAddress, sizeof(FastGuidKey));
+    return key;
 }
 
 inline bool guidZero(const FastGuidKey& key) { return key.A == 0 && key.B == 0; }
@@ -89,8 +93,25 @@ inline bool guidZero(const FastGuidKey& key) { return key.A == 0 && key.B == 0; 
 inline bool IsObjectValidFast(UObject* Obj) {
     if (!Obj) return false;
     uint32_t Flags = *reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(Obj) + 0x08);
-    if (Flags & 0x10000000) return false; 
+    if (Flags & 0x10000000) return false; // Garbage / PendingKill flag
     return true;
+}
+
+inline uint64_t FNameToKey(const FName& name) {
+    uint64_t k = 0;
+    std::memcpy(&k, &name, sizeof(uint64_t));
+    return k;
+}
+
+static std::unordered_map<uint64_t, std::string> g_fnameCache;
+
+static const std::string& GetFNameStringCached(const FName& name) {
+    uint64_t k = FNameToKey(name);
+    auto it = g_fnameCache.find(k);
+    if (it != g_fnameCache.end()) return it->second;
+    RC::StringType wNm = name.ToString();
+    std::string s(wNm.begin(), wNm.end());
+    return g_fnameCache.emplace(k, std::move(s)).first->second;
 }
 
 static std::vector<std::pair<FName, int32_t>> g_pool;
@@ -106,32 +127,43 @@ static bool chClientTrigger(FastGuidKey& outKey);
 static int g_isSrv = -1;
 static int g_isDedi = -1;
 static UObject* g_palUtil = nullptr;
+static UFunction* g_fnIsDedicatedServer = nullptr;
+static UFunction* g_fnIsServer = nullptr;
 
-static bool callUtilBool(const CharType* fnName, void* wc, bool* faulted = nullptr) {
+static bool callUtilBool(const CharType* fnName, UFunction*& cachedFn, void* wc, bool* faulted = nullptr) {
     if (faulted) *faulted = false;
     if (!wc || !IsObjectValidFast((UObject*)wc)) { if (faulted) *faulted = true; return false; }
-    if (!g_palUtil) g_palUtil = UObjectGlobals::StaticFindObject<UObject*>(nullptr, nullptr, STR("/Script/Pal.Default__PalUtility"));
+    if (!g_palUtil || !IsObjectValidFast(g_palUtil)) {
+        g_palUtil = UObjectGlobals::StaticFindObject<UObject*>(nullptr, nullptr, STR("/Script/Pal.Default__PalUtility"));
+    }
     if (!g_palUtil || !IsObjectValidFast(g_palUtil)) { if (faulted) *faulted = true; return false; }
-    UFunction* fn = g_palUtil->GetFunctionByNameInChain(fnName);
-    if (!fn) { if (faulted) *faulted = true; return false; }
+    
+    if (!cachedFn) cachedFn = g_palUtil->GetFunctionByNameInChain(fnName);
+    if (!cachedFn) { if (faulted) *faulted = true; return false; }
+    
     struct { UObject* WorldContext; bool Ret; uint8_t pad[7]; } p{};
     p.WorldContext = (UObject*)wc;
-    g_palUtil->ProcessEvent(fn, &p);
+    g_palUtil->ProcessEvent(cachedFn, &p);
     return p.Ret;
 }
 
 static void ensureRole(void* wc) {
     if (g_isSrv >= 0 || !wc) return;
-    g_isDedi = callUtilBool(STR("IsDedicatedServer"), wc) ? 1 : 0;
+    g_isDedi = callUtilBool(STR("IsDedicatedServer"), g_fnIsDedicatedServer, wc) ? 1 : 0;
     bool faulted = false;
-    g_isSrv = callUtilBool(STR("IsServer"), wc, &faulted) ? 1 : 0;
+    g_isSrv = callUtilBool(STR("IsServer"), g_fnIsServer, wc, &faulted) ? 1 : 0;
     if (faulted) { if (g_isDedi == 1) g_isSrv = 1; else g_isSrv = -1; return; }
     if (g_isDedi == 1 && g_isSrv == 0) { g_isSrv = 1; return; }
-    if (faulted) { g_isSrv = -1; return; }
 }
 
+static UObject* g_cachedPlayerCharacter = nullptr;
 static bool isClient(void* = nullptr) {
-    if (g_isSrv < 0) ensureRole(UObjectGlobals::FindFirstOf(STR("PalPlayerCharacter")));
+    if (g_isSrv < 0) {
+        if (!g_cachedPlayerCharacter || !IsObjectValidFast(g_cachedPlayerCharacter)) {
+            g_cachedPlayerCharacter = UObjectGlobals::FindFirstOf(STR("PalPlayerCharacter"));
+        }
+        ensureRole(g_cachedPlayerCharacter);
+    }
     return g_isSrv == 0;
 }
 
@@ -162,6 +194,8 @@ static int g_missLogged = 0;
 static UObject* g_common = nullptr;
 static UObject* g_donorCont = nullptr;
 static UObject* g_CachedPlayerController = nullptr;
+static UFunction* g_fnGetPawn = nullptr;
+static UFunction* g_fnIsInsideBaseCamp = nullptr;
 
 struct ClientSnap {
     std::unordered_map<std::string, int32_t> lastPool;
@@ -196,18 +230,38 @@ static UObject* createLocalSlotFast(void* wc, const FName& id, int32_t count) {
 }
 
 static void mintPoolSlots() {
-    for (UObject* s : g_mintedSlots) if (s && IsObjectValidFast(s)) s->ClearRootSet();
-    g_mintedSlots.clear();
     g_mintStampDirty = true;
-    if (!g_lastWc || g_pool.empty()) return;
-    g_mintedSlots.reserve(g_pool.size());
-    for (auto& kv : g_pool) {
-        if (kv.second <= 0) continue;
-        RC::StringType wNm = kv.first.ToString();
-        std::string nm(wNm.begin(), wNm.end());
-        if (nm.empty() || nm == "None") continue;
-        UObject* s = createLocalSlotFast(g_lastWc, kv.first, kv.second);
-        if (s) { s->SetRootSet(); g_mintedSlots.push_back(s); }
+    if (!g_lastWc || g_pool.empty()) {
+        for (UObject* s : g_mintedSlots) if (s && IsObjectValidFast(s)) s->ClearRootSet();
+        g_mintedSlots.clear();
+        return;
+    }
+
+    size_t reqNum = 0;
+    for (auto& kv : g_pool) if (kv.second > 0) reqNum++;
+
+    if (g_mintedSlots.size() != reqNum) {
+        for (UObject* s : g_mintedSlots) if (s && IsObjectValidFast(s)) s->ClearRootSet();
+        g_mintedSlots.clear();
+        g_mintedSlots.reserve(reqNum);
+
+        for (auto& kv : g_pool) {
+            if (kv.second <= 0) continue;
+            UObject* s = createLocalSlotFast(g_lastWc, kv.first, kv.second);
+            if (s) { s->SetRootSet(); g_mintedSlots.push_back(s); }
+        }
+    } else {
+        size_t idx = 0;
+        for (auto& kv : g_pool) {
+            if (kv.second <= 0) continue;
+            if (idx < g_mintedSlots.size()) {
+                UObject* s = g_mintedSlots[idx++];
+                if (s && IsObjectValidFast(s)) {
+                    *(FName*)((uint8_t*)s + OFF_SLOT_ITEMID) = kv.first;
+                    *(int32_t*)((uint8_t*)s + OFF_SLOT_COUNT) = kv.second;
+                }
+            }
+        }
     }
 }
 
@@ -261,8 +315,27 @@ static void restoreMinted() {
 
 static int g_injectDepth = 0;
 
+struct ScopedContainerInject {
+    bool isOuter;
+    ScopedContainerInject(void* worldCtx) {
+        g_lastWc = worldCtx;
+        isOuter = (g_injectDepth == 0);
+        if (isOuter) injectMintedFast();
+        ++g_injectDepth;
+    }
+    ~ScopedContainerInject() {
+        --g_injectDepth;
+        if (isOuter) restoreMinted();
+    }
+};
+
+static UObject* g_cachedInventoryData = nullptr;
+
 static UObject* findCommonContainer() {
-    UObject* inv = UObjectGlobals::FindFirstOf(STR("PalPlayerInventoryData"));
+    if (!g_cachedInventoryData || !IsObjectValidFast(g_cachedInventoryData)) {
+        g_cachedInventoryData = UObjectGlobals::FindFirstOf(STR("PalPlayerInventoryData"));
+    }
+    UObject* inv = g_cachedInventoryData;
     if (!inv || !IsObjectValidFast(inv)) return nullptr;
     uint8_t* ip = (uint8_t*)inv;
     uint8_t* commonId = ip + OFF_INV_MYINFO;
@@ -279,7 +352,10 @@ static UObject* findCommonContainer() {
 }
 
 static UObject* findDonorContainer() {
-    UObject* inv = UObjectGlobals::FindFirstOf(STR("PalPlayerInventoryData"));
+    if (!g_cachedInventoryData || !IsObjectValidFast(g_cachedInventoryData)) {
+        g_cachedInventoryData = UObjectGlobals::FindFirstOf(STR("PalPlayerInventoryData"));
+    }
+    UObject* inv = g_cachedInventoryData;
     if (!inv || !IsObjectValidFast(inv)) return nullptr;
     UObject* multi = *(UObject**)((uint8_t*)inv + OFF_INV_MULTI);
     if (!multi || !IsObjectValidFast(multi)) return nullptr;
@@ -343,37 +419,22 @@ static Target g_ac0 = { STR("placement"), SIG_PLACEMENT, 0, nullptr, false, 0 };
 typedef int64_t(__fastcall* tCollect)(void*, void*, void*, uint8_t);
 static int64_t __fastcall hkCollect(void* c, void* r, void* o, uint8_t t) {
     if (!isClient(c)) return reinterpret_cast<tCollect>(g_collect.tramp)(c, r, o, t);
-    g_lastWc = c;
-    bool outer = (g_injectDepth == 0);
-    if (outer) injectMintedFast();
-    ++g_injectDepth;
-    int64_t x = reinterpret_cast<tCollect>(g_collect.tramp)(c, r, o, t);
-    --g_injectDepth; if (outer) restoreMinted(); 
-    return x;
+    ScopedContainerInject injectGuard(c);
+    return reinterpret_cast<tCollect>(g_collect.tramp)(c, r, o, t);
 }
 
 typedef int64_t(__fastcall* t7d0)(void*, void*, void*);
 static int64_t __fastcall hk7d0(void* a1, void* a2, void* o) {
     if (!isClient(a1)) return reinterpret_cast<t7d0>(g_7d0.tramp)(a1, a2, o);
-    g_lastWc = a1;
-    bool outer = (g_injectDepth == 0);
-    if (outer) injectMintedFast();
-    ++g_injectDepth;
-    int64_t x = reinterpret_cast<t7d0>(g_7d0.tramp)(a1, a2, o);
-    --g_injectDepth; if (outer) restoreMinted();
-    return x;
+    ScopedContainerInject injectGuard(a1);
+    return reinterpret_cast<t7d0>(g_7d0.tramp)(a1, a2, o);
 }
 
 typedef int64_t(__fastcall* tAc0)(void*, void*, void*, void*);
 static int64_t __fastcall hkAc0(void* a1, void* a2, void* r, void* o) {
     if (!isClient(a1)) return reinterpret_cast<tAc0>(g_ac0.tramp)(a1, a2, r, o);
-    g_lastWc = a1;
-    bool outer = (g_injectDepth == 0);
-    if (outer) injectMintedFast();
-    ++g_injectDepth;
-    int64_t x = reinterpret_cast<tAc0>(g_ac0.tramp)(a1, a2, r, o);
-    --g_injectDepth; if (outer) restoreMinted();
-    return x;
+    ScopedContainerInject injectGuard(a1);
+    return reinterpret_cast<tAc0>(g_ac0.tramp)(a1, a2, r, o);
 }
 
 static const wchar_t* SRV_CHEST_CLASS = L"PalMapObjectItemChestModel";
@@ -431,10 +492,19 @@ static UObject* srvStorageOf(UObject* camp) {
 }
 
 static uint64_t g_lastReconcile = 0;
+static UObject* g_cachedMapObjectMgr = nullptr;
+static UObject* g_cachedBaseCampMgr = nullptr;
+static UObject* g_cachedItemContMgr = nullptr;
+static UFunction* g_fnGetBaseCampIds = nullptr;
+static UFunction* g_fnTryGetModel = nullptr;
 
 static void srvDiscoverReconcileInner() {
-    UObject* mgr = UObjectGlobals::FindFirstOf(STR("PalMapObjectManager"));
+    if (!g_cachedMapObjectMgr || !IsObjectValidFast(g_cachedMapObjectMgr)) {
+        g_cachedMapObjectMgr = UObjectGlobals::FindFirstOf(STR("PalMapObjectManager"));
+    }
+    UObject* mgr = g_cachedMapObjectMgr;
     if (!mgr || !IsObjectValidFast(mgr)) return;
+    
     uint8_t* mm = (uint8_t*)mgr + 0x310;
     uint8_t* elems = *(uint8_t**)(mm + 0x00);
     int32_t maxIdx = *(int32_t*)(mm + 0x08);
@@ -461,20 +531,26 @@ static void srvDiscoverReconcileInner() {
         freshCampId[ExtractGuid((uint8_t*)camp + OFF_CAMP_ID)] = camp;
     }
     
-    UObject* campMgr = UObjectGlobals::FindFirstOf(STR("BP_PalBaseCampManager_C"));
-    if (!campMgr || !IsObjectValidFast(campMgr)) campMgr = UObjectGlobals::FindFirstOf(STR("PalBaseCampManager"));
+    if (!g_cachedBaseCampMgr || !IsObjectValidFast(g_cachedBaseCampMgr)) {
+        g_cachedBaseCampMgr = UObjectGlobals::FindFirstOf(STR("BP_PalBaseCampManager_C"));
+        if (!g_cachedBaseCampMgr || !IsObjectValidFast(g_cachedBaseCampMgr)) {
+            g_cachedBaseCampMgr = UObjectGlobals::FindFirstOf(STR("PalBaseCampManager"));
+        }
+    }
+    UObject* campMgr = g_cachedBaseCampMgr;
     if (campMgr && IsObjectValidFast(campMgr)) {
-        UFunction* getIdsFn = campMgr->GetFunctionByNameInChain(STR("GetBaseCampIds"));
-        UFunction* tryGetFn = campMgr->GetFunctionByNameInChain(STR("TryGetModel"));
-        if (getIdsFn && tryGetFn) {
+        if (!g_fnGetBaseCampIds) g_fnGetBaseCampIds = campMgr->GetFunctionByNameInChain(STR("GetBaseCampIds"));
+        if (!g_fnTryGetModel) g_fnTryGetModel = campMgr->GetFunctionByNameInChain(STR("TryGetModel"));
+        
+        if (g_fnGetBaseCampIds && g_fnTryGetModel) {
             struct { RawTArray OutIds; } idP{};
-            campMgr->ProcessEvent(getIdsFn, &idP);
+            campMgr->ProcessEvent(g_fnGetBaseCampIds, &idP);
             if (idP.OutIds.data && idP.OutIds.num > 0 && idP.OutIds.num < 100000) {
                 for (int32_t ci = 0; ci < idP.OutIds.num; ++ci) {
                     uint8_t* gid = idP.OutIds.data + (size_t)ci * 16;
                     struct { uint8_t Id[16]; UObject* Out; bool Ret; } tp{};
                     std::memcpy(tp.Id, gid, 16);
-                    campMgr->ProcessEvent(tryGetFn, &tp);
+                    campMgr->ProcessEvent(g_fnTryGetModel, &tp);
                     if (!tp.Ret || !tp.Out || !IsObjectValidFast(tp.Out)) continue;
                     UObject* camp = tp.Out;
                     GuildData& g = fresh[srvGuildKey(camp)];
@@ -486,8 +562,13 @@ static void srvDiscoverReconcileInner() {
     }
     
     FastGuidMap freshCont;
-    UObject* contMgr = UObjectGlobals::FindFirstOf(STR("BP_PalItemContainerManager_C"));
-    if (!contMgr || !IsObjectValidFast(contMgr)) contMgr = UObjectGlobals::FindFirstOf(STR("PalItemContainerManager"));
+    if (!g_cachedItemContMgr || !IsObjectValidFast(g_cachedItemContMgr)) {
+        g_cachedItemContMgr = UObjectGlobals::FindFirstOf(STR("BP_PalItemContainerManager_C"));
+        if (!g_cachedItemContMgr || !IsObjectValidFast(g_cachedItemContMgr)) {
+            g_cachedItemContMgr = UObjectGlobals::FindFirstOf(STR("PalItemContainerManager"));
+        }
+    }
+    UObject* contMgr = g_cachedItemContMgr;
     if (contMgr && IsObjectValidFast(contMgr)) {
         uint8_t* cm = (uint8_t*)contMgr + OFF_CONT_MGR_MAP;
         uint8_t* cElems = *(uint8_t**)(cm + 0x00);
@@ -550,8 +631,9 @@ static void srvBuildForCamp(UObject* camp, std::string& out) {
     if (!camp || !IsObjectValidFast(camp)) return;
     
     const FastGuidKey playerGuild = srvGuildKey(camp);
-    std::vector<std::pair<FName, int64_t>> total;
-    total.reserve(128);
+    
+    std::unordered_map<uint64_t, std::pair<FName, int64_t>> totalMap;
+    totalMap.reserve(128);
     
     for (auto& kv : g_instToCamp) {
         UObject* ccamp = kv.second;
@@ -566,16 +648,17 @@ static void srvBuildForCamp(UObject* camp, std::string& out) {
             UObject* slot = ((UObject**)slots->data)[i]; if (!slot || !IsObjectValidFast(slot)) continue;
             int32_t cnt = *(int32_t*)((uint8_t*)slot + OFF_SLOT_COUNT); if (cnt <= 0) continue;
             FName id = *(FName*)((uint8_t*)slot + OFF_SLOT_ITEMID);
-            bool f = false; for (auto& t : total) if (t.first == id) { t.second += cnt; f = true; break; }
-            if (!f) total.emplace_back(id, (int64_t)cnt);
+            uint64_t k = FNameToKey(id);
+            auto& entry = totalMap[k];
+            entry.first = id;
+            entry.second += cnt;
         }
     }
     
     char countBuf[32];
-    for (auto& t : total) {
-        int64_t d = t.second; if (d <= 0) continue; if (d > 0x7fffffffLL) d = 0x7fffffffLL;
-        RC::StringType wnameStr = t.first.ToString();
-        std::string nameStr(wnameStr.begin(), wnameStr.end());
+    for (auto& kv : totalMap) {
+        int64_t d = kv.second.second; if (d <= 0) continue; if (d > 0x7fffffffLL) d = 0x7fffffffLL;
+        const std::string& nameStr = GetFNameStringCached(kv.second.first);
         auto res = std::to_chars(countBuf, countBuf + sizeof(countBuf), d);
         if (res.ec == std::errc()) {
             out.append(nameStr);
@@ -639,8 +722,8 @@ static void parsePoolReply(const std::string_view& str) {
     
     while (i < str.size()) {
         size_t comma = str.find(',', i);
-        std::string_view tok = str.substr(i, (comma == std::string_view::npos ? str.size() : comma) - i);
-        i = (comma == std::string_view::npos) ? str.size() : comma + 1;
+        std::string_view tok = str.substr(i, (comma == std::string::npos ? str.size() : comma) - i);
+        i = (comma == std::string::npos) ? str.size() : comma + 1;
         if (tok.empty()) continue;
         
         size_t colon = tok.rfind(':'); if (colon == std::string_view::npos) continue;
@@ -700,6 +783,7 @@ static bool g_netStarted = false;
 static std::atomic<bool> g_cliForceReconnect{false};
 static SOCKET g_listenSock = INVALID_SOCKET;
 static std::vector<NetPeer*> g_peers;
+static std::mutex g_peersMutex;
 static SOCKET g_cliSock = INVALID_SOCKET;
 static std::string g_cliRbuf;
 
@@ -716,18 +800,31 @@ static void netServerThread() {
     while (g_netRun.load()) {
         fd_set rfds, wfds; FD_ZERO(&rfds); FD_ZERO(&wfds);
         FD_SET(g_listenSock, &rfds);
-        std::vector<NetPeer*> snap = g_peers; 
+        
+        std::vector<NetPeer*> snap;
+        {
+            std::lock_guard<std::mutex> lock(g_peersMutex);
+            snap = g_peers;
+        }
+        
         for (auto* p : snap) {
             if (p->dead) continue;
             FD_SET(p->sock, &rfds);
             if (p->OutboundRep.Ready.load(std::memory_order_acquire)) FD_SET(p->sock, &wfds);
         }
+        
         timeval tv{0, 50000}; 
         select(0, &rfds, &wfds, nullptr, &tv);
         
         if (FD_ISSET(g_listenSock, &rfds)) {
             SOCKET cs = accept(g_listenSock, nullptr, nullptr);
-            if (cs != INVALID_SOCKET) { ConfigureSocketFast(cs); auto* p = new NetPeer(); p->sock = cs; g_peers.push_back(p); }
+            if (cs != INVALID_SOCKET) { 
+                ConfigureSocketFast(cs); 
+                auto* p = new NetPeer(); 
+                p->sock = cs; 
+                std::lock_guard<std::mutex> lock(g_peersMutex);
+                g_peers.push_back(p); 
+            }
         }
         
         for (auto* p : snap) {
@@ -753,9 +850,16 @@ static void netServerThread() {
             }
         }
         
-        for (auto it = g_peers.begin(); it != g_peers.end(); ) {
-            if ((*it)->dead) { if ((*it)->sock != INVALID_SOCKET) closesocket((*it)->sock); delete *it; it = g_peers.erase(it); }
-            else ++it;
+        {
+            std::lock_guard<std::mutex> lock(g_peersMutex);
+            for (auto it = g_peers.begin(); it != g_peers.end(); ) {
+                if ((*it)->dead) { 
+                    if ((*it)->sock != INVALID_SOCKET) closesocket((*it)->sock); 
+                    delete *it; 
+                    it = g_peers.erase(it); 
+                }
+                else ++it;
+            }
         }
     }
 }
@@ -829,8 +933,11 @@ static void netStart() {
 static void netStop() {
     g_netRun.store(false);
     if (g_netThread.joinable()) g_netThread.join();
-    for (auto* p : g_peers) { if (p->sock != INVALID_SOCKET) closesocket(p->sock); delete p; }
-    g_peers.clear();
+    {
+        std::lock_guard<std::mutex> lock(g_peersMutex);
+        for (auto* p : g_peers) { if (p->sock != INVALID_SOCKET) closesocket(p->sock); delete p; }
+        g_peers.clear();
+    }
     if (g_cliSock != INVALID_SOCKET) { closesocket(g_cliSock); g_cliSock = INVALID_SOCKET; }
     if (g_listenSock != INVALID_SOCKET) { closesocket(g_listenSock); g_listenSock = INVALID_SOCKET; }
     WSACleanup();
@@ -849,14 +956,16 @@ static bool clientInCamp() {
     s_last = now;
     
     UObject* ctrl = GetLocalPlayerControllerFast(); if (!ctrl) return (s_cached = false);
-    UFunction* getPawn = ctrl->GetFunctionByNameInChain(STR("K2_GetPawn")); if (!getPawn) return (s_cached = false);
-    struct { UObject* Ret; } pp{}; ctrl->ProcessEvent(getPawn, &pp);
+    if (!g_fnGetPawn) g_fnGetPawn = ctrl->GetFunctionByNameInChain(STR("K2_GetPawn")); 
+    if (!g_fnGetPawn) return (s_cached = false);
+    
+    struct { UObject* Ret; } pp{}; ctrl->ProcessEvent(g_fnGetPawn, &pp);
     UObject* pawn = pp.Ret; if (!pawn || !IsObjectValidFast(pawn)) return (s_cached = false);
     
     UObject* chk = *(UObject**)((uint8_t*)pawn + OFF_PAWN_CAMPCHECK); if (!chk || !IsObjectValidFast(chk)) return (s_cached = false);
-    UFunction* isInside = chk->GetFunctionByNameInChain(STR("IsInsideBaseCamp"));
-    if (isInside) {
-        struct { bool Ret; uint8_t pad[7]; } ir{}; chk->ProcessEvent(isInside, &ir);
+    if (!g_fnIsInsideBaseCamp) g_fnIsInsideBaseCamp = chk->GetFunctionByNameInChain(STR("IsInsideBaseCamp"));
+    if (g_fnIsInsideBaseCamp) {
+        struct { bool Ret; uint8_t pad[7]; } ir{}; chk->ProcessEvent(g_fnIsInsideBaseCamp, &ir);
         return (s_cached = ir.Ret);
     }
     
@@ -877,8 +986,10 @@ static bool clientInCampStable() {
 
 static bool chClientTrigger(FastGuidKey& outKey) {
     UObject* ctrl = GetLocalPlayerControllerFast(); if (!ctrl) return false;
-    UFunction* getPawn = ctrl->GetFunctionByNameInChain(STR("K2_GetPawn")); if (!getPawn) return false;
-    struct { UObject* Ret; } pp{}; ctrl->ProcessEvent(getPawn, &pp);
+    if (!g_fnGetPawn) g_fnGetPawn = ctrl->GetFunctionByNameInChain(STR("K2_GetPawn")); 
+    if (!g_fnGetPawn) return false;
+    
+    struct { UObject* Ret; } pp{}; ctrl->ProcessEvent(g_fnGetPawn, &pp);
     UObject* pawn = pp.Ret; if (!pawn || !IsObjectValidFast(pawn)) return false;
     
     UObject* chk = *(UObject**)((uint8_t*)pawn + OFF_PAWN_CAMPCHECK);
@@ -899,8 +1010,8 @@ static void hkEnterCamp(UnrealScriptFunctionCallableContext& ctx, void*) {
         UObject* eventOwner = ctx.Context->GetOuterPrivate();
         UObject* ctrl = GetLocalPlayerControllerFast();
         if (ctrl && eventOwner && IsObjectValidFast(eventOwner)) {
-            UFunction* gp = ctrl->GetFunctionByNameInChain(STR("K2_GetPawn"));
-            if (gp) { struct { UObject* Ret; } pp{}; ctrl->ProcessEvent(gp, &pp); if (pp.Ret && pp.Ret != eventOwner) return; }
+            if (!g_fnGetPawn) g_fnGetPawn = ctrl->GetFunctionByNameInChain(STR("K2_GetPawn"));
+            if (g_fnGetPawn) { struct { UObject* Ret; } pp{}; ctrl->ProcessEvent(g_fnGetPawn, &pp); if (pp.Ret && pp.Ret != eventOwner) return; }
         }
     }
     g_poolDirty.store(true); g_needTrigger.store(true);
@@ -913,8 +1024,8 @@ static void hkExitCamp(UnrealScriptFunctionCallableContext& ctx, void*) {
         UObject* eventOwner = ctx.Context->GetOuterPrivate();
         UObject* ctrl = GetLocalPlayerControllerFast();
         if (ctrl && eventOwner && IsObjectValidFast(eventOwner)) {
-            UFunction* gp = ctrl->GetFunctionByNameInChain(STR("K2_GetPawn"));
-            if (gp) { struct { UObject* Ret; } pp{}; ctrl->ProcessEvent(gp, &pp); if (pp.Ret && pp.Ret != eventOwner) return; }
+            if (!g_fnGetPawn) g_fnGetPawn = ctrl->GetFunctionByNameInChain(STR("K2_GetPawn"));
+            if (g_fnGetPawn) { struct { UObject* Ret; } pp{}; ctrl->ProcessEvent(g_fnGetPawn, &pp); if (pp.Ret && pp.Ret != eventOwner) return; }
         }
     }
     if (g_lastEnterAt != 0 && (GetTickCount64() - g_lastEnterAt) < 3000) return;
@@ -947,7 +1058,14 @@ static void resetState() {
     g_poolDirty.store(false); g_needTrigger.store(false); g_awaitingReply.store(false); g_lastTrigAt = 0;
     g_consecMiss = 0; g_missLogged = 0; g_lastFetchOk = 0; g_inCampStable = false; g_inCampStreak = 0;
     g_inCampLastSampleAt = 0; g_inCampHook = false; g_inCampHookKnown = false; g_isSrv = -1; g_lastWc = nullptr;
-    for (auto* p : g_peers) { p->snap.wantFull = true; p->snap.initialized = false; }
+    g_cachedMapObjectMgr = nullptr; g_cachedBaseCampMgr = nullptr; g_cachedItemContMgr = nullptr;
+    g_fnGetBaseCampIds = nullptr; g_fnTryGetModel = nullptr; g_CachedPlayerController = nullptr;
+    g_fnGetPawn = nullptr; g_fnIsInsideBaseCamp = nullptr; g_fnameCache.clear(); g_cachedPlayerCharacter = nullptr;
+    
+    {
+        std::lock_guard<std::mutex> lock(g_peersMutex);
+        for (auto* p : g_peers) { p->snap.wantFull = true; p->snap.initialized = false; }
+    }
 }
 
 static void checkWorld(void* anyObj) {
@@ -957,12 +1075,61 @@ static void checkWorld(void* anyObj) {
     if (w != g_lastWorld) { if (g_lastWorld) resetState(); g_lastWorld = w; }
 }
 
-static void loadConfig() { } // Unchanged parsing, omitted for length. Re-implement IO stream parsing based on charconv.
+static void loadConfig() {
+    wchar_t modPath[MAX_PATH] = { 0 };
+    HMODULE hMod = NULL;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCWSTR)&loadConfig, &hMod);
+    if (!hMod) return;
+    GetModuleFileNameW(hMod, modPath, MAX_PATH);
+
+    std::wstring wPath(modPath);
+    size_t pos = wPath.find_last_of(L"\\/");
+    if (pos == std::wstring::npos) return;
+    std::wstring cfgPath = wPath.substr(0, pos) + L"\\..\\config.txt";
+
+    std::ifstream file(cfgPath);
+    if (!file.is_open()) return;
+
+    std::string line;
+    while (std::getline(file, line)) {
+        size_t commentPos = line.find_first_of("#;");
+        if (commentPos != std::string::npos) line = line.substr(0, commentPos);
+        
+        size_t eqPos = line.find('=');
+        if (eqPos == std::string::npos) continue;
+
+        auto trim = [](std::string_view s) {
+            while (!s.empty() && std::isspace((unsigned char)s.front())) s.remove_prefix(1);
+            while (!s.empty() && std::isspace((unsigned char)s.back())) s.remove_suffix(1);
+            return s;
+        };
+
+        std::string_view key = trim(line.substr(0, eqPos));
+        std::string_view val = trim(line.substr(eqPos + 1));
+
+        if (key == "verbose") g_verbose = (val == "true" || val == "1");
+        else if (key == "reconcile_interval_ms") {
+            uint64_t v = 0;
+            if (std::to_chars(val.data(), val.data() + val.size(), v).ec == std::errc() && v >= 500) g_reconcileMs = v;
+        }
+        else if (key == "external_channel") g_extEnabled = (val == "true" || val == "1");
+        else if (key == "external_port") {
+            uint16_t v = 0;
+            if (std::to_chars(val.data(), val.data() + val.size(), v).ec == std::errc()) g_extPort = (uint16_t)v;
+        }
+        else if (key == "external_server_host") g_extHost = std::string(val);
+        else if (key == "channel_delta") g_chDelta = (val == "true" || val == "1");
+        else if (key == "channel_full_sync_interval") {
+            uint64_t v = 0;
+            if (std::to_chars(val.data(), val.data() + val.size(), v).ec == std::errc() && v >= 5000) g_chFullSyncMs = v;
+        }
+    }
+}
 
 class ModIntegratedStorageCpp : public CppUserModBase {
 public:
     ModIntegratedStorageCpp() : CppUserModBase() {
-        ModName = STR("IntegratedStorageCpp"); ModVersion = STR("4.0.8");
+        ModName = STR("IntegratedStorageCpp"); ModVersion = STR("4.1.0");
     }
     ~ModIntegratedStorageCpp() override {
         netStop();
@@ -981,7 +1148,13 @@ public:
     auto on_update() -> void override {
         uint64_t now = GetTickCount64();
         static uint64_t g_lastWorldProbe = 0;
-        if (now - g_lastWorldProbe > 1000) { g_lastWorldProbe = now; checkWorld(UObjectGlobals::FindFirstOf(STR("PalPlayerCharacter"))); }
+        if (now - g_lastWorldProbe > 1000) { 
+            g_lastWorldProbe = now; 
+            if (!g_cachedPlayerCharacter || !IsObjectValidFast(g_cachedPlayerCharacter)) {
+                g_cachedPlayerCharacter = UObjectGlobals::FindFirstOf(STR("PalPlayerCharacter"));
+            }
+            checkWorld(g_cachedPlayerCharacter); 
+        }
         if (g_isSrv < 0) { isClient(); return; }
         if (!g_netStarted) { g_netStarted = true; netStart(); }
         
@@ -1015,23 +1188,26 @@ public:
             return;
         }
         
-        for (auto* p : g_peers) {
-            if (p->dead || !p->InboundReq.Ready.load(std::memory_order_acquire)) continue;
-            std::string hexStr = p->InboundReq.Data;
-            p->InboundReq.Ready.store(false, std::memory_order_release);
-            
-            FastGuidKey guidKey;
-            auto hexVal = [](char c)->int { if(c>='0'&&c<='9') return c-'0'; if(c>='a'&&c<='f') return c-'a'+10; return 0; };
-            for(int i = 0; i < 16; ++i) reinterpret_cast<uint8_t*>(&guidKey)[i] = (hexVal(hexStr[i*2]) << 4) | hexVal(hexStr[i*2+1]);
-            
-            UObject* camp = srvCampById(guidKey);
-            if (!camp) continue;
-            
-            if (!(guidKey == p->lastCampHex)) { p->snap.wantFull = true; p->lastCampHex = guidKey; }
-            
-            if (!p->OutboundRep.Ready.load(std::memory_order_acquire)) {
-                srvBuildReply(&p->snap, camp, p->OutboundRep.Data);
-                p->OutboundRep.Ready.store(true, std::memory_order_release);
+        {
+            std::lock_guard<std::mutex> lock(g_peersMutex);
+            for (auto* p : g_peers) {
+                if (p->dead || !p->InboundReq.Ready.load(std::memory_order_acquire)) continue;
+                std::string hexStr = p->InboundReq.Data;
+                p->InboundReq.Ready.store(false, std::memory_order_release);
+                
+                FastGuidKey guidKey;
+                auto hexVal = [](char c)->int { if(c>='0'&&c<='9') return c-'0'; if(c>='a'&&c<='f') return c-'a'+10; return 0; };
+                for(int i = 0; i < 16; ++i) reinterpret_cast<uint8_t*>(&guidKey)[i] = (hexVal(hexStr[i*2]) << 4) | hexVal(hexStr[i*2+1]);
+                
+                UObject* camp = srvCampById(guidKey);
+                if (!camp) continue;
+                
+                if (!(guidKey == p->lastCampHex)) { p->snap.wantFull = true; p->lastCampHex = guidKey; }
+                
+                if (!p->OutboundRep.Ready.load(std::memory_order_acquire)) {
+                    srvBuildReply(&p->snap, camp, p->OutboundRep.Data);
+                    p->OutboundRep.Ready.store(true, std::memory_order_release);
+                }
             }
         }
         if (g_lastReconcile == 0 || now - g_lastReconcile >= g_reconcileMs) { g_lastReconcile = now; srvDiscoverReconcile(); }
