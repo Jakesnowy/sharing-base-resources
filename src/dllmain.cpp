@@ -97,23 +97,6 @@ inline bool IsObjectValidFast(UObject* Obj) {
     return true;
 }
 
-inline uint64_t FNameToKey(const FName& name) {
-    uint64_t k = 0;
-    std::memcpy(&k, &name, sizeof(uint64_t));
-    return k;
-}
-
-static std::unordered_map<uint64_t, std::string> g_fnameCache;
-
-static const std::string& GetFNameStringCached(const FName& name) {
-    uint64_t k = FNameToKey(name);
-    auto it = g_fnameCache.find(k);
-    if (it != g_fnameCache.end()) return it->second;
-    RC::StringType wNm = name.ToString();
-    std::string s(wNm.begin(), wNm.end());
-    return g_fnameCache.emplace(k, std::move(s)).first->second;
-}
-
 static std::vector<std::pair<FName, int32_t>> g_pool;
 
 static UObject* findCommonContainer();
@@ -157,12 +140,16 @@ static void ensureRole(void* wc) {
 }
 
 static UObject* g_cachedPlayerCharacter = nullptr;
-static bool isClient(void* = nullptr) {
+static bool isClient(void* wc = nullptr) {
     if (g_isSrv < 0) {
-        if (!g_cachedPlayerCharacter || !IsObjectValidFast(g_cachedPlayerCharacter)) {
-            g_cachedPlayerCharacter = UObjectGlobals::FindFirstOf(STR("PalPlayerCharacter"));
+        void* ctx = wc;
+        if (!ctx) {
+            if (!g_cachedPlayerCharacter || !IsObjectValidFast(g_cachedPlayerCharacter)) {
+                g_cachedPlayerCharacter = UObjectGlobals::FindFirstOf(STR("PalPlayerCharacter"));
+            }
+            ctx = g_cachedPlayerCharacter;
         }
-        ensureRole(g_cachedPlayerCharacter);
+        ensureRole(ctx);
     }
     return g_isSrv == 0;
 }
@@ -632,7 +619,7 @@ static void srvBuildForCamp(UObject* camp, std::string& out) {
     
     const FastGuidKey playerGuild = srvGuildKey(camp);
     
-    std::unordered_map<uint64_t, std::pair<FName, int64_t>> totalMap;
+    std::unordered_map<std::string, int64_t> totalMap;
     totalMap.reserve(128);
     
     for (auto& kv : g_instToCamp) {
@@ -648,20 +635,19 @@ static void srvBuildForCamp(UObject* camp, std::string& out) {
             UObject* slot = ((UObject**)slots->data)[i]; if (!slot || !IsObjectValidFast(slot)) continue;
             int32_t cnt = *(int32_t*)((uint8_t*)slot + OFF_SLOT_COUNT); if (cnt <= 0) continue;
             FName id = *(FName*)((uint8_t*)slot + OFF_SLOT_ITEMID);
-            uint64_t k = FNameToKey(id);
-            auto& entry = totalMap[k];
-            entry.first = id;
-            entry.second += cnt;
+            
+            RC::StringType wnameStr = id.ToString();
+            std::string nameStr(wnameStr.begin(), wnameStr.end());
+            totalMap[nameStr] += cnt;
         }
     }
     
     char countBuf[32];
     for (auto& kv : totalMap) {
-        int64_t d = kv.second.second; if (d <= 0) continue; if (d > 0x7fffffffLL) d = 0x7fffffffLL;
-        const std::string& nameStr = GetFNameStringCached(kv.second.first);
+        int64_t d = kv.second; if (d <= 0) continue; if (d > 0x7fffffffLL) d = 0x7fffffffLL;
         auto res = std::to_chars(countBuf, countBuf + sizeof(countBuf), d);
         if (res.ec == std::errc()) {
-            out.append(nameStr);
+            out.append(kv.first);
             out.push_back(':');
             out.append(countBuf, res.ptr);
             out.push_back(',');
@@ -1005,7 +991,7 @@ static bool chClientTrigger(FastGuidKey& outKey) {
 }
 
 static void hkEnterCamp(UnrealScriptFunctionCallableContext& ctx, void*) {
-    if (!isClient()) return;
+    if (!isClient(ctx.Context)) return;
     if (ctx.Context) {
         UObject* eventOwner = ctx.Context->GetOuterPrivate();
         UObject* ctrl = GetLocalPlayerControllerFast();
@@ -1019,7 +1005,7 @@ static void hkEnterCamp(UnrealScriptFunctionCallableContext& ctx, void*) {
 }
 
 static void hkExitCamp(UnrealScriptFunctionCallableContext& ctx, void*) {
-    if (!isClient()) return;
+    if (!isClient(ctx.Context)) return;
     if (ctx.Context) {
         UObject* eventOwner = ctx.Context->GetOuterPrivate();
         UObject* ctrl = GetLocalPlayerControllerFast();
@@ -1060,7 +1046,7 @@ static void resetState() {
     g_inCampLastSampleAt = 0; g_inCampHook = false; g_inCampHookKnown = false; g_isSrv = -1; g_lastWc = nullptr;
     g_cachedMapObjectMgr = nullptr; g_cachedBaseCampMgr = nullptr; g_cachedItemContMgr = nullptr;
     g_fnGetBaseCampIds = nullptr; g_fnTryGetModel = nullptr; g_CachedPlayerController = nullptr;
-    g_fnGetPawn = nullptr; g_fnIsInsideBaseCamp = nullptr; g_fnameCache.clear(); g_cachedPlayerCharacter = nullptr;
+    g_fnGetPawn = nullptr; g_fnIsInsideBaseCamp = nullptr; g_cachedPlayerCharacter = nullptr;
     
     {
         std::lock_guard<std::mutex> lock(g_peersMutex);
@@ -1129,7 +1115,7 @@ static void loadConfig() {
 class ModIntegratedStorageCpp : public CppUserModBase {
 public:
     ModIntegratedStorageCpp() : CppUserModBase() {
-        ModName = STR("IntegratedStorageCpp"); ModVersion = STR("4.1.0");
+        ModName = STR("IntegratedStorageCpp"); ModVersion = STR("4.1.2");
     }
     ~ModIntegratedStorageCpp() override {
         netStop();
