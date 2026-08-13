@@ -46,70 +46,55 @@ jobs:
           Pop-Location
           Write-Host "RE-UE4SS cloned successfully"
 
-      - name: Inject mod into RE-UE4SS using xmake (native, no CMake)
+      - name: Build mod as standalone xmake project
         shell: pwsh
         run: |
-          $modDir = Join-Path "RE-UE4SS\cppmods" $env:MOD_NAME
+          # Create standalone mod build directory
+          $modBuildDir = Join-Path $env:GITHUB_WORKSPACE "build\$($env:MOD_NAME)"
+          New-Item -ItemType Directory -Force -Path $modBuildDir | Out-Null
           
-          # Create mod directory in RE-UE4SS cppmods tree
-          New-Item -ItemType Directory -Force -Path $modDir | Out-Null
-          
-          # Copy source files directly
+          # Copy source files to build directory
           Write-Host "Copying dllmain.cpp..."
-          Copy-Item src\dllmain.cpp (Join-Path $modDir "dllmain.cpp") -Force
+          Copy-Item src\dllmain.cpp "$modBuildDir\dllmain.cpp" -Force
           
-          # Copy xmake.lua if it exists in mod root (for standalone builds)
-          $xmakeSrc = Join-Path (Get-Location) "src\xmake.lua"
-          if (Test-Path $xmakeSrc) {
-            $xmakeDst = Join-Path $modDir "xmake.lua"
-            Copy-Item $xmakeSrc $xmakeDst -Force
-            Write-Host "Copied xmake.lua to mod directory"
-          } else {
-            Write-Host "xmake.lua not found in src/, will use RE-UE4SS default config"
-          }
-          
-          # Add to cppmods/xmake.lua using correct RE-UE4SS format
-          $cppmodsXmake = Join-Path "RE-UE4SS\cppmods\xmake.lua"
-          if (Test-Path $cppmodsXmake) {
-            $content = Get-Content $cppmodsXmake -Raw
-            
-            # Check if mod is already added
-            if ($content -notmatch [regex]::Escape($env:MOD_NAME)) {
-              # Remove existing targetmods block and replace with updated version
-              $escapedName = ('"' + $env:MOD_NAME + '"').Replace('"', '\"')
-              $newTargetMods = 'set targetmods {"EventViewerMod", "' + $escapedName + '"}'
-              $content = $content.Replace(
-                'set targetmods {"EventViewerMod"}',
-                $newTargetMods
-              )
-              Set-Content $cppmodsXmake $content -NoNewline
-              Write-Host "Added $($env:MOD_NAME) to cppmods/xmake.lua"
-            } else {
-              Write-Host "$($env:MOD_NAME) already in targetmods, skipping"
-            }
-          } else {
-            Write-Host "WARNING: RE-UE4SS/cppmods/xmake.lua not found - mod may not build correctly"
-          }
-          
-          Write-Host "Mod injected into RE-UE4SS tree at $modDir"
+          # Create xmake.lua for standalone build
+          $xmakeContent = @'
+set targetproject ""
+set projectname "${{ env.MOD_NAME }}"
 
-      - name: Build mod with xmake (native, fast Windows toolchain)
-        shell: pwsh
-        run: |
-          Set-Location "RE-UE4SS"
-          $modName = $env:MOD_NAME
+add_rules("mode.debug", "mode.release")
+
+target "${{ env.MOD_NAME }}"
+    setkind "shared"
+    addincludes("${{ github.workspace }}/src")
+    adddefines("_CRT_SECURE_NO_WARNINGS")
+    
+    # Polyhook2 dependency (from RE-UE4SS build tree)
+    addincludedirs("$(RE_UE4SS_ROOT)/include")
+    addsyslibdirs("$(RE_UE4SS_ROOT)/lib/x64")
+    
+    addsystemlib("polyhook_2")
+    
+    addfiles("*.cpp")
+'@
           
-          # Configure xmake for the mod
-          Write-Host "Configuring $modName with xmake..."
-          .\xmake f -p windows -a x64 --target=$modName -y
+          $xmakePath = Join-Path $modBuildDir "xmake.lua"
+          Set-Content -Path $xmakePath -Value $xmakeContent -NoNewline
+          
+          Write-Host "Created xmake.lua at:"
+          Write-Host "  $($xmakePath)"
+          
+          # Build the mod
+          Set-Location $modBuildDir
+          Write-Host "`nConfiguring with xmake..."
+          .\xmake f -p windows -a x64 --target="${{ env.MOD_NAME }}" -y
           
           if ($LASTEXITCODE -ne 0) {
             throw "xmake configuration failed"
           }
           
-          # Build the mod DLL
-          Write-Host "Building $modName..."
-          .\xmake build -v -t $modName
+          Write-Host "`nBuilding..."
+          .\xmake build -v
           
           if ($LASTEXITCODE -ne 0) {
             throw "xmake build failed"
@@ -118,16 +103,10 @@ jobs:
       - name: Verify built DLL exists and is valid
         shell: pwsh
         run: |
-          # Try both possible build output locations
-          $buildDir = "RE-UE4SS\x64-windows_release\$env:MOD_NAME"
+          $buildDir = Join-Path $env:GITHUB_WORKSPACE "build\$($env:MOD_NAME)"
           
           if (-not (Test-Path $buildDir)) {
-            # Try alternate build location
-            $buildDir = "RE-UE4SS\output\debug\dllmain_fixed\x64-windows_release\$env:MOD_NAME"
-          }
-          
-          if (-not (Test-Path $buildDir)) {
-            throw "ERROR: Build directory not found at $buildDir or $buildDir"
+            throw "ERROR: Build directory not found at $buildDir"
           }
           
           $dll = Get-ChildItem -Path $buildDir -Recurse -Filter "$env:MOD_NAME.dll" -ErrorAction SilentlyContinue |
@@ -135,6 +114,10 @@ jobs:
             Select-Object -First 1
           
           if (-not $dll) {
+            Write-Host "DLL not found, listing all files:"
+            Get-ChildItem $buildDir -Recurse | ForEach-Object { 
+              Write-Host "  $($_.FullName)" 
+            }
             throw "ERROR: compiled $env:MOD_NAME.dll not found in build directory"
           }
           
@@ -153,7 +136,7 @@ jobs:
         shell: pwsh
         run: |
           # Find the built DLL
-          $buildDir = "RE-UE4SS\x64-windows_release\$env:MOD_NAME"
+          $buildDir = Join-Path $env:GITHUB_WORKSPACE "build\$($env:MOD_NAME)"
           
           if (-not (Test-Path $buildDir)) {
             throw "ERROR: Build directory not found at $buildDir"
@@ -170,13 +153,13 @@ jobs:
           Write-Host "found dll: $($dll.FullName)"
           
           # Create installable package structure
-          $dist = "dist\$env:MOD_NAME"
+          $dist = Join-Path $env:GITHUB_WORKSPACE "dist\$($env:MOD_NAME)"
           New-Item -ItemType Directory -Force -Path "$dist\dlls" | Out-Null
           
           # Copy DLL to dlls directory
           Copy-Item $dll.FullName "$dist\dlls\main.dll" -Force
           
-          # Copy enabled.txt (enables the mod)
+          # Create enabled.txt (enables the mod)
           New-Item -ItemType File -Force -Path "$dist\enabled.txt" | Out-Null
           
           # Use the repo's config.txt with full Chinese comments
@@ -209,3 +192,5 @@ jobs:
           name: ${{ env.MOD_NAME }}.zip
           path: ${{ env.MOD_NAME }}.zip
           retention-days: 30
+
+<EOF>

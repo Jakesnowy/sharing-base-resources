@@ -1,310 +1,495 @@
-# IntegratedStorageCpp - Complete Usage Guide (JakeSnowy Fork)
+# IntegratedStorageCpp - Comprehensive Usage Guide (JakeSnowy Fork)
 
 **GitHub:** https://github.com/Jakesnowy/sharing-base-resources  
-**Base Version:** Sarfflow's IntegratedStorageCpp v4.1.2 with P0 fixes  
-**Fork Features:** All three P0 critical fixes + TCP channel + B3+B4 optimizations  
+**Base Version:** Sarfflow's IntegratedStorageCpp v4.1.2 with P0 Critical Fixes  
+**Fork URL:** https://github.com/Jakesnowy/sharing-base-resources/  
 
 ---
 
-## 🚀 Quick Start - Zero Configuration Mode!
+## 🎯 Quick Answer: How To Use This Fork
 
-### The Easy Way (For Most Users)
+### For Most Users (Zero-Config Mode - RECOMMENDED)
 
-**Want to play with friends?** Just do this:
+**Just follow these 3 steps:**
 
-1. **Build DLL once** on one machine
-2. **Copy DLL to EVERY machine** (server + all clients)
-3. **Use default `config.txt`** - no changes needed!
-4. **Play!** No IP/port/firewall configuration required!
+1. **Build the DLL once** on any machine
+2. **Copy to ALL machines** (server + every client)
+3. **Play!** No IP/port/firewall configuration needed!
 
-Your fork uses **Zero-Config Default Mode**:
-- ✅ Works out-of-the-box with original RPC-based multiplayer  
-- ✅ Just copy DLL and play - no IP/port/firewall needed  
-- ✅ All three P0 critical fixes still active for stability  
-- ✅ Falls back to tested original behavior seamlessly
+```bash
+# Build (first time only):
+git clone https://github.com/Jakesnowy/sharing-base-resources.git
+cd sharing-base-resources
+xmake f -y -p windows -a x64 --target=ModIntegratedStorageCpp
+xmake build -v -t ModIntegratedStorageCpp
 
-See [`USAGE_GUIDE.md`](#) for detailed advanced configuration if you need it.
+# Copy DLL to EVERY machine:
+<build-output>/ModIntegratedStorageCpp.dll \
+    -> <Palworld-install>/Pal/Binaries/Win64/Mods/ModIntegratedStorageCpp/dlls/main.dll
+
+# Play! The default config.txt uses external_channel = false for zero-config mode.
+```
+
+### Why Zero-Config Mode Works
+
+This fork defaults to `external_channel = false` because:
+- ✅ All three P0 critical fixes still provide major stability improvements
+- ✅ Original RPC-based multiplayer works perfectly for 2-4 players
+- ✅ No IP/port/firewall configuration required
+- ✅ Just copy DLL and play - truly zero configuration
 
 ---
 
-## 📖 Documentation Overview
+## 📖 Complete Documentation Index
 
 ### For End Users:
-- **[`README.md`](<README.md>)** - Main documentation with zero-config deployment guide
-- **[`FIXES_README.md`](<FIXES_README.md>)** - User-focused guide with P0 fixes overview  
+- **[`README.md`](<README.md>)** - Main documentation with quick-start guide
+- **[`USAGE_GUIDE.md`](<USAGE_GUIDE.md>)** - This complete usage guide (you are here)
+- **[`FIXES_README.md`](<FIXES_README.md>)** - User-focused P0 fixes overview
 - **[`FORK_README.md`](<FORK_README.md>)** - Quick reference guide
 
 ### For Developers:
-- **[`CRITICAL_FIXES_SUMMARY.md`](<CRITICAL_FIXES_SUMMARY.md>)** - Technical analysis confirming all fixes present
-- **[`DOCS_AUDIT_SUMMARY.md`](<DOCS_AUDIT_SUMMARY.md>)** - Comprehensive audit verification
+- **[`CRITICAL_FIXES_SUMMARY.md`](<CRITICAL_FIXES_SUMMARY.md>)** - Technical implementation details
+- **[`COMPREHENSIVE_AUDIT_REPORT.md`](<COMPREHENSIVE_AUDIT_REPORT.md>)** - Full audit results
+- **`.github/workflows/build.yml`** - GitHub Actions build configuration
 
 ---
 
-## ⚡ Co-op Troubleshooting Guide - Hosts and Clients
+## 🚀 Installation & Deployment
 
-### Quick Decision Tree: Which Configuration Do I Need?
+### Prerequisites
 
-```
-┌───────────────────────────────────────────────────────────────┐
-│  What's Your Use Case?                                        │
-├───────────────────────────────────────────────────────────────┤
-│                                                                │
-│  A) Casual Co-op (2-4 players, same LAN or close network)      │
-│     → Use ZERO-COFIG DEFAULT: external_channel = false         │
-│     → No IP/port configuration needed!                         │
-│     → Just copy DLL and play ✅                                 │
-│                                                                │
-│  B) Large Guild (6+ players, many bases)                       │
-│     → Enable external_channel = true                           │
-│     → Configure TCP channel as below                           │
-│                                                                │
-│  C) Dedicated Server on Separate Machine                       │
-│     → Enable external_channel = true                            │
-│     → Configure TCP channel with server IP                     │
-│                                                                │
-└───────────────────────────────────────────────────────────────┘
-```
+Before building or deploying, ensure you have:
+- ✅ Windows 10/11 (64-bit)
+- ✅ Visual Studio 2022 Build Tools with "Desktop development with C++" workload
+- ✅ Git for Windows
+- ✅ xmake build system (script will install automatically if needed)
 
----
-
-### Scenario A: Zero-Config Mode (Default - NO Configuration Needed!)
-
-**Best for:** 2-4 players, casual co-op sessions  
-**Network Type:** RPC-based (original UE multiplayer behavior)
-
-#### Setup Steps:
-1. **Build DLL once** on one machine
-2. **Copy DLL to ALL machines:**
-   ```bash
-   <build-output>/ModIntegratedStorageCpp.dll \
-       -> <Pal>/Pal/Binaries/Win64/Mods/ModIntegratedStorageCpp/dlls/main.dll
-   ```
-3. **Verify `config.txt` on each machine:**
-   ```ini
-   # This is the DEFAULT - no changes needed!
-   external_channel = false  # ← Leave as-is for zero-config mode
-   ```
-4. **Launch Palworld** and play!
-
-#### What Happens Behind the Scenes:
-- Mod uses original UE4SS RPC-based multiplayer behavior
-- All three P0 critical fixes still active (P0-a, P0-b, P0-c) ✅
-- No IP/port/firewall configuration needed
-- Just copy DLL → Play!
-
----
-
-### Scenario B: Advanced TCP Mode (When You Need It)
-
-**Best for:** Large guilds (6+ players), dedicated servers, edge cases  
-**Network Type:** External TCP channel + RPC fallback
-
-#### When to Enable TCP Channel:
-
-Enable `external_channel = true` if you need:
-- ✅ Zero buffer saturation under heavy load
-- ✅ Dedicated network thread (never blocks game thread)
-- ✅ Maximum stability for 6+ concurrent players
-- ✅ Multiple bases with many items tracked
-
-#### How to Enable:
-
-1. **Edit `config.txt` on ALL machines:**
-   ```ini
-   # ADVANCED MODE - Uncomment and configure:
-   external_channel = true           # Enable TCP channel
-   external_port = 27500             # Must match EXACTLY on all machines
-   
-   # On CLIENTS only (not server):
-   external_server_host = 192.168.1.XXX  # Fill with server's LAN IP
-   ```
-
-2. **Server config.txt** (just listen for connections):
-   ```ini
-   external_channel = true
-   external_port = 27500
-   # Server doesn't need external_server_host - it listens on all interfaces
-   ```
-
-3. **Client config.txt** (must connect to server):
-   ```ini
-   external_channel = true
-   external_port = 27500
-   external_server_host = 192.168.1.XXX  # ← Server's IP address
-   
-   # Example: Find your LAN IP on Windows
-   # 1. Open Command Prompt (cmd.exe)
-   # 2. Run: ipconfig
-   # 3. Look for "IPv4" under your active network adapter
-   ```
-
-#### Finding Server's LAN IP (Windows):
+### Build from Source (One-Time Setup)
 
 ```bash
-# Method 1: Using Command Prompt
-cmd.exe /c "ipconfig"
-# Look for IPv4 address under your active network adapter
-# Example output:
-# Ethernet adapter vEthernet:
-#   IPv4 Address . . . . . . . . . : 192.168.1.10
+# Clone your fork
+git clone https://github.com/Jakesnowy/sharing-base-resources.git
+cd sharing-base-resources
 
-# Method 2: Using PowerShell
-powershell -Command "Get-NetIPAddress | Where-Object {$_.AddressFamily -eq 'InterNetwork'}"
+# First-time: Bootstrap environment and build
+.\build.ps1 -Bootstrap -UE4SSRoot D:\src\RE-UE4SS -Zip
+
+# Subsequent builds (environment already ready):
+.\build.ps1 -UE4SSRoot D:\src\RE-UE4SS -Zip
+```
+
+### Manual Build Commands
+
+```bash
+# Clone RE-UE4SS SDK (first time only)
+git clone https://github.com/UE4SS-RE/RE-UE4SS.git RE-UE4SS
+cd RE-UE4SS
+xmake f -y --vs2022 --platform=win64
+xmake build --only=polyhook_2 --only=cppmods
+
+# Build your fork's DLL
+cd ..\sharing-base-resources
+xmake f -y -p windows -a x64 --target=ModIntegratedStorageCpp
+xmake build -v -t ModIntegratedStorageCpp
+```
+
+### Build Output Locations
+
+After successful build, find your DLL at:
+1. **Primary:** `dist/ModIntegratedStorageCpp/dlls/main.dll`
+2. **Also available in:** `RE-UE4SS\x64-windows_release\ModIntegratedStorageCpp\` (if built there)
+3. **GitHub Actions:** See `.github/workflows/build.yml` for automated builds
+
+### Deploy DLL to ALL Machines
+
+**CRITICAL:** The SAME DLL must be on every machine (server + all clients).
+
+```bash
+# Location in Palworld installation:
+<UE4-Pal-Install>/Pal/Binaries/Win64/Mods/ModIntegratedStorageCpp/dlls/main.dll
+
+# Copy your built DLL to this location on EVERY machine:
+D:\xmake\output\debug\dllmain_fixed\x64-windows_release\ModIntegratedStorageCpp\ModIntegratedStorageCpp.dll \
+    -> D:\SteamLibrary\steamapps\common\Palworld\Pal\Binaries\Win64\Mods\ModIntegratedStorageCpp\dlls\main.dll
+
+# OR copy from build output:
+dist/ModIntegratedStorageCpp/dlls/main.dll \
+    -> <each-machine>/Pal/Binaries/Win64/Mods/ModIntegratedStorageCpp/dlls/main.dll
+```
+
+**Quick Deploy Script:**
+```powershell
+# Copy to all machines in a directory:
+Copy-Item "C:\path\to\build\dist\ModIntegratedStorageCpp\dlls\main.dll" `
+    -Destination "D:\AllMachines\*" `
+    -Recurse `
+    -Force
+
+# Then copy each machine's DLL to Palworld:
+$palPath = "D:\SteamLibrary\steamapps\common\Palworld\Pal\Binaries\Win64\Mods\ModIntegratedStorageCpp\dlls"
+Copy-Item "$env:TEMP\isg\main.dll" $palPath -Force
 ```
 
 ---
 
-### Common Co-op Issues & Solutions
+## ⚙️ Configuration Guide
 
-#### Issue 1: "Friends Can't See My Storage"
+### Location of Configuration File
 
-**Symptoms:** Client joins server but materials don't appear in shared pool.
+Edit this file on **EVERY** machine:
+```
+<UE4-Pal-Install>/Pal/Binaries/Win64/Mods/ModIntegratedStorageCpp/config.txt
+```
 
-**Causes & Fixes:**
+### Default Configuration (Zero-Config Mode)
 
-| Cause | Solution |
-|-------|----------|
-| Different DLL versions on machines | **VERIFY:** Same DLL on ALL machines (server + clients) |
-| `config.txt` missing on some machines | Copy `config.txt` to ALL machines alongside DLL |
-| External channel enabled on server but not clients | Enable on ALL machines consistently |
-| Firewall blocking connections | See firewall troubleshooting below |
+The default `config.txt` is optimized for zero-config deployment:
 
-**Quick Fix Steps:**
-1. Verify same DLL version on all machines
-2. Verify `config.txt` exists and has same content everywhere
-3. For zero-config mode: ensure `external_channel = false` on all machines
-4. Restart UE4SS mod manager on all machines
-5. Re-launch Palworld
+```ini
+# ============================================================================
+#  IntegratedStorage - JakeSnowy Fork v4.1.2-fixes (Zero-Config Default)
+#  GitHub: https://github.com/Jakesnowy/sharing-base-resources
+# ============================================================================
+
+# verbose : Enable detailed [ISGATE] diagnostic logs in UE4SS.log
+verbose = true
+
+# reconcile_interval_ms : Server-side discovery reconcile cadence (ms)
+reconcile_interval_ms = 8000
+
+# isi_refresh_ms : Remote client refresh frequency (compat only)
+isi_refresh_ms = 1500
+
+# ============================================================================
+#  EXTERNAL TCP CHANNEL - DISABLED BY DEFAULT FOR ZERO-CONFIG MODE!
+# ============================================================================
+external_channel = false  # ← Leave as-is for zero-config deployment
+external_port = 27500
+external_server_host =    # Not used when channel is disabled
+
+# LAYER 2: Delta Sync (Optional performance optimization)
+channel_delta = true
+channel_full_sync_interval = 3600000
+
+# LAYER 3: Delay Reply (Optional reentrancy protection)
+channel_delay_reply = false
+
+# ============================================================================
+#  ALL THREE P0 CRITICAL FIXES ARE ACTIVE REGARDLESS OF CHANNEL MODE:
+#   - P0-a: Local player filter (prevents flickering from remote events)
+#   - P0-b: Camp lookup cache (eliminates FindAllOf blocking)
+#   - P0-c: Food box exclusion (fixes food consumption issues)
+# ============================================================================
+```
+
+### When To Enable TCP Channel
+
+Enable `external_channel = true` **ONLY** if you need:
+- Large guilds (6+ concurrent players)
+- Dedicated servers on separate machines
+- Maximum stability under heavy load
+- Zero buffer saturation guarantees
+
+**For most users (2-4 players), keep it disabled!** See the advanced configuration section below.
 
 ---
 
-#### Issue 2: "Server Won't Start Mod"
+## 🎮 Multiplayer Usage Scenarios
 
-**Symptoms:** Server launches but mod doesn't load, no "[ISGATE]" logs.
+### Scenario A: Local Host/SP Co-op (Most Common)
 
-**Causes & Fixes:**
+**Setup:** One player hosts on their machine, friends join as clients.
 
-| Cause | Solution |
-|-------|----------|
-| DLL corrupted during copy | Rebuild DLL and redeploy |
-| Wrong DLL location | Verify: `Mods/ModIntegratedStorageCpp/dlls/main.dll` |
-| `config.txt` has invalid settings | Check for typos, ensure no commented-out lines with values |
+**Configuration:**
+- **Host machine:** Default `config.txt` (`external_channel = false`)
+- **Client machines:** Default `config.txt` (`external_channel = false`)
+- **No IP/port configuration needed!**
+
+```bash
+# Host just builds once and shares DLL to all clients
+Host: Build DLL → Copy to host's Palworld Mods folder
+
+# Share DLL with all friends:
+Friends copy same DLL to their Palworld Mods folders
+
+# Everyone plays! No additional configuration.
+```
+
+**What Happens:**
+- Host reads cross-registered containers natively (no external channel needed)
+- Clients use original RPC-based multiplayer for item requests
+- All P0 fixes active for stability
+- **Zero troubleshooting required** ✅
+
+---
+
+### Scenario B: Dedicated Server on Separate Machine
+
+**Setup:** Dedicated server process runs on separate machine, clients connect.
+
+**Configuration Options:**
+
+#### Option 1: Zero-Config Mode (Recommended for Small Guilds)
+
+```ini
+# On DEDICATED SERVER:
+external_channel = false  # ← Default mode - no IP/port needed!
+reconcile_interval_ms = 8000
+
+# On CLIENTS:
+external_channel = false  # ← Default mode matches server
+```
+
+**Benefits:**
+- ✅ No IP/port configuration required
+- ✅ Works with original RPC-based multiplayer  
+- ✅ All P0 fixes still active for stability
+
+#### Option 2: Advanced TCP Mode (Large Guilds Only)
+
+```ini
+# On DEDICATED SERVER (just listen, no IP needed):
+external_channel = true           # Enable advanced channel
+external_port = 27500             # TCP port (must match on clients)
+# external_server_host is NOT needed on server
+
+# On CLIENTS (connect to server's LAN IP):
+external_channel = true
+external_port = 27500
+external_server_host = 192.168.1.XXX  # ← Server's LAN IP address
+```
+
+**When to Use:**
+- 6+ concurrent players
+- Many bases with complex storage layouts
+- Need zero buffer saturation guarantees
+- Edge cases requiring dedicated network thread
+
+---
+
+### Scenario C: LAN Party / Large Guild Session
+
+**Setup:** Multiple hosts or one host with many clients in same network.
+
+**Configuration:**
+
+```ini
+# On HOST (authoritative end):
+external_channel = false  # ← Default works perfectly for LAN!
+reconcile_interval_ms = 15000  # Slightly longer for larger guilds
+
+# On ALL CLIENTS:
+external_channel = false
+```
+
+**For Very Large Guilds (6+ players, many bases):**
+
+```ini
+# Host config:
+external_channel = true
+external_port = 27500
+
+# Client configs (each uses their own IP):
+external_channel = true
+external_port = 27500
+external_server_host = <host's LAN IP>
+```
+
+---
+
+## 🔧 Advanced Configuration Options
+
+### P0 Critical Fixes (Always Active - No Configuration Needed!)
+
+This fork includes all three P0 critical fixes that work **independently** of the communication channel:
+
+| Fix | What It Does | Impact | Location |
+|-----|-------------|--------|----------|
+| **P0-a** | Filters remote player events on host-side (only local player events trigger pool refresh) | Eliminates flickering from remote events, prevents RPC storm | `src/dllmain.cpp:994-1017` |
+| **P0-b** | Uses cached camp lookup via `g_campIdToCamp` TMap instead of O(N) FindAllOf | Eliminates blocking thread on every request | `src/dllmain.cpp:438,610` |
+| **P0-c** | Excludes food boxes from storage cross-registration | Fixes food consumption issues | `src/dllmain.cpp:427,511` |
+
+**These fixes provide major stability improvements regardless of channel mode!**
+
+---
+
+### Server-Side Configuration Tuning
+
+#### Reconcile Interval (`reconcile_interval_ms`)
+
+The server performs a discovery reconcile every N milliseconds to rebuild guild state.
+
+| Use Case | Recommended Value | Reason |
+|----------|------------------|--------|
+| Single player / Small guild (<3 players) | 8000ms (default) | Fast enough, minimal overhead |
+| Medium guild (3-5 players) | 15000ms | Balance between freshness and performance |
+| Large guild (6+ players, many bases) | 30000ms | Reduce background overhead |
+
+**Example for large guild:**
+```ini
+reconcile_interval_ms = 30000
+channel_full_sync_interval = 120000  # Full resync every 2 minutes as recovery fallback
+```
+
+#### Delta Sync Configuration (`channel_delta`)
+
+Controls whether the channel sends only changed items or full dumps.
+
+| Setting | Behavior | Best For |
+|---------|----------|----------|
+| `true` (default) | Sends only changed items (delta) | Performance, reduced bandwidth |
+| `false` | Always sends full pool dump | Debugging, first requests after reconnect |
+
+**Recommendation:** Keep enabled (`true`) for production use. Disable only for debugging.
+
+---
+
+### Client-Side Configuration
+
+Clients typically don't need to configure anything. The default settings work perfectly.
+
+#### When Clients Need Special Configuration
+
+If clients experience issues, verify these match the server:
+
+```ini
+# On client config.txt - must match server's channel mode:
+external_channel = false  # OR true if server uses it
+
+# If using external channel, must specify server's LAN IP:
+external_server_host = <server's LAN IP>
+```
+
+**Note:** Server IP can be found using `ipconfig` on Windows - look for IPv4 address under active network adapter.
+
+---
+
+## 🐛 Troubleshooting Guide
+
+### Quick Diagnostic Checklist
+
+Before reporting issues, verify:
+
+1. ✅ **Same DLL on all machines** - Check file sizes and dates match
+2. ✅ **Config.txt exists on all machines** - Missing config breaks mod loading
+3. ✅ **Firewall rules allow port 27500** (if using TCP channel)
+4. ✅ **All machines use same channel mode** (all false, or all true with correct IPs)
+5. ✅ **Verbose logging enabled** (`verbose = true`) for diagnostic output
+
+---
+
+### Issue #1: "Materials Don't Appear in Shared Pool"
+
+**Symptoms:** Client joins server but sees only their own camp's materials.
+
+**Possible Causes & Fixes:**
+
+| Cause | Fix |
+|-------|-----|
+| Different DLL versions on machines | **VERIFY:** Same DLL everywhere (compare file sizes) |
+| Missing `config.txt` on some machines | Copy `config.txt` to ALL machines alongside DLL |
+| Mixed channel modes (server: true, clients: false) | Enable/disable channel consistently on all machines |
+| Firewall blocking connections | Add firewall rule for port 27500 (if using TCP channel) |
 
 **Quick Fix:**
 ```bash
-# 1. Remove old mod folder completely
+# Delete mod folder and redeploy fresh on ALL machines:
 <UE4-Pal-Install>/Pal/Binaries/Win64/Mods/ModIntegratedStorageCpp/ -R
 
-# 2. Re-deploy fresh DLL and config.txt
-# (Copy from build output to correct location)
+# Redeploy DLL and config.txt from same build output to all machines
 ```
 
 ---
 
-#### Issue 3: "Clients Can't Connect to Server"
+### Issue #2: "Server Won't Start Mod"
+
+**Symptoms:** Server launches but no "[ISGATE]" logs in UE4SS.log.
+
+**Possible Causes & Fixes:**
+
+| Cause | Fix |
+|-------|-----|
+| DLL corrupted during copy | Rebuild DLL and redeploy fresh |
+| Wrong DLL location | Verify: `Mods/ModIntegratedStorageCpp/dlls/main.dll` |
+| Invalid config.txt settings | Check for typos, invalid values |
+| Missing config.txt | Ensure `config.txt` is in mod folder (zero-config mode requires it) |
+
+**Quick Fix:**
+```bash
+# Remove old mod folder completely:
+<UE4-Pal-Install>/Pal/Binaries/Win64/Mods/ModIntegratedStorageCpp/ -R
+
+# Redeploy fresh DLL and config.txt from build output
+```
+
+---
+
+### Issue #3: "Clients Can't Connect to Server"
 
 **Symptoms:** Clients show connection timeout, server logs no incoming connections.
 
-**Causes & Fixes:**
-
 | Cause | Solution |
 |-------|----------|
-| **Firewall blocking TCP port 27500** | Add firewall rule (see below) |
+| **Firewall blocking TCP port 27500** | Add firewall rule (see Firewall Configuration section) |
 | Wrong IP in client config.txt | Use LAN IP, not public IP |
-| Server listening on wrong interface | See server binding options below |
-| NAT/Router issues for external connections | Use port forwarding or dedicated server hosting |
-
-**Firewall Configuration (Windows):**
-
-```powershell
-# Add firewall rule to allow TCP port 27500
-New-NetFirewallRule -DisplayName "ISGATE TCP Channel" `
-    -Direction Inbound `
-    -Protocol TCP `
-    -LocalPort 27500 `
-    -Action Allow `
-    -Description "IntegratedStorageCpp external communication channel"
-
-# Verify rule was added
-Get-NetFirewallRule -DisplayName "ISGATE TCP Channel"
-```
-
-**Advanced: Make Server Listen on Specific Interface:**
-
-If server has multiple network interfaces (LAN + WAN), add this to server's config.txt:
-
-```ini
-# Optional: Bind to specific interface (useful if you have multiple adapters)
-# Uncomment and specify IP of the interface that clients will connect from
-# external_listen_interface = 192.168.1.50
-```
-
-**Without this line:** Server listens on all interfaces (default behavior - works for LAN).
+| Server listening on wrong interface | See Server Binding Options below |
 
 ---
 
-#### Issue 4: "Pool Flickers or Shows Wrong Items"
+### Issue #4: "Pool Flickers or Shows Wrong Items"
 
-**Symptoms:** Materials appear/disappear, wrong quantities shown in shared pool.
+**Symptoms:** Materials appear/disappear, wrong quantities shown.
 
-**This is Expected Behavior During Discovery!**
+**This is Often Normal!**
 
 **What's Happening:**
-- The mod performs a discovery reconcile every `reconcile_interval_ms` (default: 8000ms)
-- During reconciliation, the pool may temporarily show incorrect states
-- After ~8s, the pool stabilizes and shows correct merged storage
+- The mod performs discovery reconcile every `reconcile_interval_ms` (default: 8000ms)
+- During reconciliation (~8s), the pool may temporarily show incorrect states
+- After reconciliation completes, the pool stabilizes and shows correct merged storage
 
 **Solutions:**
 
 | Cause | Solution |
 |-------|----------|
-| Too frequent reconcile interval | Increase in server's config.txt: `reconcile_interval_ms = 15000` |
-| Network lag causing missed updates | Keep clients on same network (LAN preferred) |
-| Client not stable in camp (P0-a fix should prevent this) | Verify P0-a is active in fork (check code comments) |
-
-**For Large Guilds:** Increase reconcile interval:
-```ini
-# Server config.txt - for 6+ players with many bases:
-reconcile_interval_ms = 30000  # Reduce overhead, pool syncs every 30s
-channel_full_sync_ms = 120000  # Full resync every 2 minutes as recovery fallback
-```
+| Too frequent reconcile interval | Increase in server config: `reconcile_interval_ms = 15000` |
+| Network lag causing missed updates | Keep clients on same LAN (preferred) |
+| Client not stable in camp | P0-a fix should prevent this; verify fork has `[FIX P0-a]` marker |
 
 ---
 
-#### Issue 5: "Pal Summoning Fails After 10 Minutes"
-
-**Symptoms:** Works fine initially but fails after extended play.
-
-**This is Expected! The P0-a Fix Should Prevent This.**
-
-**If Still Occurring:**
-- Verify P0-a fix is active: check `[FIX P0-a]` in `src/dllmain.cpp` at line 993
-- Check UE4SS.log for "[ISGATE]" messages about pool clearing
-- If problem persists, this may be a different issue unrelated to storage mod
-
----
-
-#### Issue 6: "Food Items Disappear After Consumption"
+### Issue #5: "Food Items Disappear After Consumption"
 
 **Symptoms:** Food items from cross-registered chests disappear after being consumed.
 
-**This is Expected! The P0-c Fix Should Prevent This.**
+**This Should NOT Happen!** The P0-c fix addresses this.
 
-**If Still Occurring:**
-- Verify P0-c fix is active: check `[FIX P0-c]` in `src/dllmain.cpp` at lines 427, 511
-- Ensure no food boxes are incorrectly registered as storage
-- Check for corrupted save files (try new base)
+**Verification Steps:**
+1. Check fork code has `[FIX P0-c]` markers at lines 427 and 511
+2. Ensure no food boxes are incorrectly registered as storage
+3. Try new base if save file may be corrupted
 
 ---
 
-### Firewall Configuration Checklist
+### Issue #6: "Pal Summoning Fails After 10 Minutes"
 
-Before enabling external TCP channel, ensure firewall rules are in place:
+**Symptoms:** Works fine initially but fails after extended play session.
 
-#### Windows Firewall Rules Needed:
+**This Should NOT HappEN!** The P0-a fix should prevent this.
+
+**Verification Steps:**
+1. Verify P0-a fix is active: check `[FIX P0-a]` in `src/dllmain.cpp` at line 994
+2. Check UE4SS.log for "[ISGATE]" messages about pool clearing
+3. If problem persists, this may be a different issue unrelated to storage mod
+
+---
+
+## 🔥 Firewall Configuration (TCP Channel Only)
+
+### Windows Firewall Rules Needed (When `external_channel = true`)
 
 ```powershell
-# 1. Allow TCP port 27500 inbound
+# 1. Add inbound rule for TCP port 27500
 New-NetFirewallRule -DisplayName "ISGATE TCP Port 27500" `
     -Direction Inbound `
     -Protocol TCP `
@@ -314,180 +499,199 @@ New-NetFirewallRule -DisplayName "ISGATE TCP Port 27500" `
 
 # 2. Verify rule is active
 Get-NetFirewallRule | Where-Object { $_.DisplayName -like "*ISGATE*" }
+
+# To remove firewall rule later:
+New-NetFirewallRule -DisplayName "ISGATE TCP Port 27500" -WhatIf
 ```
 
-#### For Dedicated Servers:
+### For Dedicated Servers
 
-If running dedicated server on separate machine:
 1. Configure firewall on **server machine** (allow incoming connections)
 2. Add port 27500 to Windows Firewall allow list
-3. Consider adding router port forwarding if accessing from outside LAN
+3. Consider router port forwarding if accessing from outside LAN
 
 ---
 
-### Network Configuration Best Practices
+## 🔍 Debugging & Diagnostics
 
-#### For Small Guilds (2-4 players):
-
-```ini
-# Recommended: Use zero-config mode, no advanced networking needed!
-external_channel = false  # ← Default is fine
-```
-
-**Why:** Original RPC-based multiplayer with P0 fixes provides excellent stability for small groups.
-
----
-
-#### For Large Guilds (6+ players) or Dedicated Servers:
-
-```ini
-# Recommended: Enable TCP channel for maximum stability
-external_channel = true
-external_port = 27500
-
-# On server: leave external_server_host empty (listens on all interfaces)
-# On clients: set to server's LAN IP
-external_server_host = 192.168.1.XXX  # ← Server's IP only!
-```
-
-**Network Considerations:**
-
-- **LAN vs WAN:** For best performance, keep all players on same LAN
-- **Router Port Forwarding:** Required only for external (non-LAN) connections
-- **NAT Traversal:** May cause issues if accessing from outside local network
-
----
-
-### Testing Checklist Before Going Live
-
-#### Zero-Config Mode Test:
-1. ✅ Deploy on localhost with 2-3 players (virtual machine test)
-2. ✅ Play for 30+ minutes in multi-base scenario
-3. ✅ Verify food consumption works reliably
-4. ✅ Verify Pal summoning still works after 10+ minutes
-
-#### TCP Channel Mode Test:
-1. ✅ Server starts successfully on separate machine
-2. ✅ All clients connect without firewall errors
-3. ✅ Materials display correctly from all bases
-4. ✅ Play for 30+ minutes with 6+ players
-5. ✅ No buffer saturation or paralysis issues
-
----
-
-### Debugging Tips
-
-#### Enable Verbose Logging:
+### Enable Verbose Logging
 
 ```ini
 # In config.txt on ALL machines:
 verbose = true  # Enables [ISGATE] diagnostic logs in UE4SS.log
 ```
 
-**What to Look For in Logs:**
-- Client menu open/request/reply tracking
-- Server-side per-chest + discovery tracking  
-- Connection attempts and successful replies
-
-#### Common Log Messages:
-
+**What to Look For:**
 ```
 [ISGATE] Client menu opened for player X
-[ISGATE] Pool reply sent to client with count: 42
+[ISGATE] Pool reply sent with count: 42
 [ISGATE] Discovery reconcile completed, found 120 merged slots
 [ISGATE] Connection established from 192.168.1.XXX
+[ISGATE] [FIX P0-a] hkEnterCamp local player filter active
+[ISGATE] [FIX P0-b] Camp lookup cache hit
+[ISGATE] [FIX P0-c] Food box excluded from storage
+```
+
+### Reading UE4SS Logs
+
+UE4SS.log is typically located at:
+```
+<UE4-Pal-Install>/Pal/Saved/SaveGames/{YourSave}/UE4SS.log
+```
+
+**Common Messages:**
+- `[ISGATE] Client menu opened` - Normal, client requesting pool data
+- `[ISGATE] Pool reply sent` - Server responding to client request  
+- `[ISGATE] Discovery reconcile` - Server rebuilding guild state
+- `[ISGATE] Connection established` - TCP channel active (if enabled)
+- `[ISGATE] ROLE server=X dedicated=Y` - Mod role detection
+
+---
+
+## 🧪 Testing & Validation
+
+### Pre-Deployment Test
+
+**Minimum Viable Test:**
+1. Deploy on localhost (same machine) with 2-3 players via virtual network
+2. Play for 30+ minutes in a multi-base scenario
+3. Verify no gradual degradation occurs
+4. **Test food consumption repeatedly** - this is what P0-c fixes!
+5. Test Pal summoning multiple times
+
+### Production Readiness Test
+
+1. Dedicated server on separate machine (or host-SP)
+2. 5+ remote clients (casual mode) or large guild (advanced mode with TCP enabled)
+3. Multiple bases with different resource specializations
+4. Extended session (1+ hour)
+5. Stress test: frequent base transitions, item use, construction
+
+---
+
+## 🔄 Migration Guide
+
+### From Zero-Config to TCP Mode
+
+```ini
+# Edit config.txt on ALL machines:
+external_channel = true          # Change from false to true
+external_port = 27500             # Verify this matches
+external_server_host = <server-ip>  # Add only on clients
+
+# Restart Palworld on all machines (mod needs reload)
+```
+
+### From TCP Mode to Zero-Config
+
+```ini
+# Edit config.txt on ALL machines:
+external_channel = false          # Change from true to false
+
+# Close and restart Palworld on all machines
+# Mod will automatically fall back to RPC-based multiplayer
 ```
 
 ---
 
-### Migration Guide: Switching Between Modes
+## ✅ Validation Checklist
 
-#### From Zero-Config to TCP Mode:
+### Pre-deployment:
+- [ ] Code compiles without warnings
+- [ ] All P0 fixes confirmed in source code comments (`[FIX P0-a]`, `[FIX P0-b]`, `[FIX P0-c]`)
+- [ ] TCP channel disabled by default (check `config.txt` shows `external_channel = false`)
 
-1. Edit `config.txt` on **ALL machines**:
-   ```ini
-   external_channel = true          # Change from false to true
-   external_port = 27500             # Verify this matches
-   external_server_host = <server-ip>  # Add only on clients
-   ```
+### Post-deployment (Single Machine Test):
+- [ ] DLL loads correctly in UE4SS
+- [ ] No console errors on startup
+- [ ] Shared materials display correctly
+- [ ] Cross-base construction works
+- [ ] **Food consumption works reliably** (key P0-c fix verification!)
 
-2. Restart Palworld on all machines (mod needs reload)
-
-3. Test with 3-4 players first before full deployment
-
-#### From TCP Mode to Zero-Config:
-
-1. Edit `config.txt` on **ALL machines**:
-   ```ini
-   external_channel = false          # Change from true to false
-   ```
-
-2. Clear any pending connections (close and restart)
-
-3. Mod will automatically fall back to RPC-based multiplayer
+### Multiplayer Test:
+- [ ] Server starts successfully
+- [ ] All clients connect without issues
+- [ ] Play for 30+ minutes in multi-base scenario
+- [ ] No gradual performance degradation
+- [ ] Pal summoning still works after 10+ minutes
+- [ ] Other mods remain functional
 
 ---
 
-### Troubleshooting Summary Table
+## 🚀 GitHub Actions Build (Optional)
 
-| Symptom | Likely Cause | Quick Fix |
-|---------|--------------|-----------|
-| Can't see materials in pool | Different DLL versions | Re-deploy same DLL everywhere |
-| Server won't start mod | Corrupted config.txt | Delete folder, redeploy fresh |
-| Clients can't connect | Firewall blocking port | Add firewall rule for 27500 |
-| Pool flickers during play | Normal discovery behavior | Wait 8s or increase reconcile interval |
-| Food items disappear | P0-c fix should prevent this | Verify fork code has `[FIX P0-c]` marker |
-| Pal summoning fails after 10min | Should not happen with P0-a fix | Check UE4SS.log for other issues |
-| Connection timeout | Wrong server IP in config.txt | Use LAN IP, not public IP |
+### Setup Required
 
----
+1. **Create GitHub PAT Token:**
+   - Visit https://github.com/settings/tokens
+   - Create token with "Public repositories" scope
+   - Copy token string (starts with `ghp_...`)
 
-## 📖 Additional Documentation
+2. **Add to Repository Secrets:**
+   - Go to repo Settings → Secrets and variables → Actions
+   - Click "New repository secret"
+   - Name: `GH_PAT` (exact name, case-sensitive)
+   - Value: Paste PAT token
 
-### For Users: Start Here
-- **[`USAGE_GUIDE.md`](<USAGE_GUIDE.md>)** - This document, complete with co-op troubleshooting
-- **[`FIXES_README.md`](<FIXES_README.md>)** - User-focused guide with P0 fixes overview
-- **[`FORK_README.md`](<FORK_README.md>)** - Quick reference guide
+### Build Workflow
 
-### For Developers: Technical Deep Dives
-- **[`CRITICAL_FIXES_SUMMARY.md`](<CRITICAL_FIXES_SUMMARY.md>)** - Implementation details and architecture
-- **[`DOCS_AUDIT_SUMMARY.md`](<DOCS_AUDIT_SUMMARY.md>)** - Documentation audit verification
+The build runs automatically when you push changes to the `main` or `master` branch.
 
----
-
-## 🚀 Build Automation (Optional)
-
-```bash
-# PowerShell build script with one-command deployment
-.\build.ps1 <path-to-pal-install>
-
-# Example:
-.\build.ps1 D:\SteamLibrary\steamapps\common\Palworld
-```
+**Output locations:**
+1. **GitHub Actions Artifacts tab** (30-day retention)
+2. **Local repository:** `dist/ModIntegratedStorageCpp/` folder and zip file
+3. **Download URL:** Create release on GitHub Releases tab to publish
 
 ---
 
-## 📝 Zero-Config Default Mode
+## 📚 FAQ
 
-### Why Zero-Config is the Default:
+### Q: Can I play with friends without configuring anything?
 
-Your fork uses `external_channel = false` by default because:
-1. **Most users don't need it:** 2-4 players work perfectly with RPC-based multiplayer
-2. **No troubleshooting required:** Just copy DLL and play
-3. **All P0 fixes still active:** Stability improvements work regardless of channel mode
-4. **Backwards compatible:** Falls back to tested original behavior seamlessly
+**A:** Yes! Just use the default `config.txt` with `external_channel = false`. This fork's zero-config mode works out-of-the-box with original RPC-based multiplayer.
 
-### When You Might Want Advanced Mode:
+### Q: Do I need to enable TCP channel for large guilds?
 
-Enable `external_channel = true` only if you need:
-- Large guilds (6+ concurrent players)
-- Dedicated servers on separate machines
-- Multiple bases with many items tracked
-- Zero buffer saturation under heavy load
+**A:** Not strictly necessary, but recommended for 6+ players or dedicated servers. See advanced configuration section for enabling.
 
-See the TCP Channel section above for configuration details.
+### Q: Why do P0 fixes work regardless of channel mode?
+
+**A:** P0 fixes address fundamental stability issues in the mod's core logic. They operate independently of the communication channel used for item data transfer.
+
+### Q: What happens if I mix channel modes (server: true, clients: false)?
+
+**A:** The server will attempt to use TCP while clients expect RPC-based communication, resulting in connection failures. Keep all machines in same mode.
+
+### Q: Can I switch between zero-config and TCP mode at runtime?
+
+**A:** No. Configuration changes require restarting Palworld on ALL machines (mod needs to reload).
+
+---
+
+## 📖 Additional Resources
+
+- **Main Documentation:** [`README.md`](<README.md>)
+- **Quick Reference:** [`FORK_README.md`](<FORK_README.md>)  
+- **P0 Fixes Overview:** [`FIXES_README.md`](<FIXES_README.md>)
+- **Technical Deep Dive:** [`CRITICAL_FIXES_SUMMARY.md`](<CRITICAL_FIXES_SUMMARY.md>)
+- **GitHub Actions Setup:** [`.github/DEPLOYMENT.md`](<.github/DEPLOYMENT.md>)
+
+---
+
+## 📝 Configuration Summary
+
+| Config Key | Default | When to Change |
+|-----------|---------|----------------|
+| `verbose` | `true` | Set to `false` for production (reduces log spam) |
+| `reconcile_interval_ms` | `8000` | Increase for large guilds (>5 players) |
+| `external_channel` | `false` | Enable only for advanced networking needs |
+| `channel_delta` | `true` | Keep enabled for performance |
+| `channel_delay_reply` | `false` | Keep disabled unless debugging edge cases |
 
 ---
 
 **End of Usage Guide**
-<EOF>
+
+**Last Updated:** 2024  
+**Maintained by:** JakeSnowy (https://github.com/Jakesnowy)  
+**Base Project:** Sarfflow/IntegratedStorageCpp v4.1.2
