@@ -49,19 +49,23 @@ jobs:
       - name: Inject mod into RE-UE4SS using xmake (native, no CMake)
         shell: pwsh
         run: |
-          $modDir = "RE-UE4SS\cppmods\$env:MOD_NAME"
+          $modDir = Join-Path "RE-UE4SS\cppmods" $env:MOD_NAME
           
           # Create mod directory in RE-UE4SS cppmods tree
           New-Item -ItemType Directory -Force -Path $modDir | Out-Null
           
           # Copy source files directly
           Write-Host "Copying dllmain.cpp..."
-          Copy-Item src\dllmain.cpp "$modDir\dllmain.cpp" -Force
+          Copy-Item src\dllmain.cpp (Join-Path $modDir "dllmain.cpp") -Force
           
-          # Remove any existing xmake.lua to avoid conflicts
-          if (Test-Path "$modDir\xmake.lua") {
-            Remove-Item "$modDir\xmake.lua" -Force
-            Write-Host "Removed existing xmake.lua in mod directory"
+          # Copy xmake.lua if it exists in mod root (for standalone builds)
+          $xmakeSrc = Join-Path (Get-Location) "src\xmake.lua"
+          if (Test-Path $xmakeSrc) {
+            $xmakeDst = Join-Path $modDir "xmake.lua"
+            Copy-Item $xmakeSrc $xmakeDst -Force
+            Write-Host "Copied xmake.lua to mod directory"
+          } else {
+            Write-Host "xmake.lua not found in src/, will use RE-UE4SS default config"
           }
           
           # Add to cppmods/xmake.lua using correct RE-UE4SS format
@@ -113,10 +117,16 @@ jobs:
       - name: Verify built DLL exists and is valid
         shell: pwsh
         run: |
+          # Try both possible build output locations
           $buildDir = "RE-UE4SS\x64-windows_release\$env:MOD_NAME"
           
           if (-not (Test-Path $buildDir)) {
-            throw "ERROR: Build directory not found at $buildDir"
+            # Try alternate build location
+            $buildDir = "RE-UE4SS\output\debug\dllmain_fixed\x64-windows_release\$env:MOD_NAME"
+          }
+          
+          if (-not (Test-Path $buildDir)) {
+            throw "ERROR: Build directory not found at $buildDir or $buildDir"
           }
           
           $dll = Get-ChildItem -Path $buildDir -Recurse -Filter "$env:MOD_NAME.dll" -ErrorAction SilentlyContinue |
@@ -198,5 +208,3 @@ jobs:
           name: ${{ env.MOD_NAME }}.zip
           path: ${{ env.MOD_NAME }}.zip
           retention-days: 30
-
-<EOF>

@@ -1,10 +1,46 @@
-**Status:** ✅ Production-ready, multiplayer-stable, optimized for large guilds.
+# IntegratedStorageCpp - Complete Usage Guide (JakeSnowy Fork)
 
-All P0 fixes (P0-a, P0-b, P0-c) are now properly documented and reflected in the actual code state at `src/dllmain.cpp`.
+**GitHub:** https://github.com/Jakesnowy/sharing-base-resources  
+**Base Version:** Sarfflow's IntegratedStorageCpp v4.1.2 with P0 fixes  
+**Fork Features:** All three P0 critical fixes + TCP channel + B3+B4 optimizations  
 
 ---
 
-## 🆘 Co-op Troubleshooting Guide - Hosts and Clients
+## 🚀 Quick Start - Zero Configuration Mode!
+
+### The Easy Way (For Most Users)
+
+**Want to play with friends?** Just do this:
+
+1. **Build DLL once** on one machine
+2. **Copy DLL to EVERY machine** (server + all clients)
+3. **Use default `config.txt`** - no changes needed!
+4. **Play!** No IP/port/firewall configuration required!
+
+Your fork uses **Zero-Config Default Mode**:
+- ✅ Works out-of-the-box with original RPC-based multiplayer  
+- ✅ Just copy DLL and play - no IP/port/firewall needed  
+- ✅ All three P0 critical fixes still active for stability  
+- ✅ Falls back to tested original behavior seamlessly
+
+See [`USAGE_GUIDE.md`](#) for detailed advanced configuration if you need it.
+
+---
+
+## 📖 Documentation Overview
+
+### For End Users:
+- **[`README.md`](<README.md>)** - Main documentation with zero-config deployment guide
+- **[`FIXES_README.md`](<FIXES_README.md>)** - User-focused guide with P0 fixes overview  
+- **[`FORK_README.md`](<FORK_README.md>)** - Quick reference guide
+
+### For Developers:
+- **[`CRITICAL_FIXES_SUMMARY.md`](<CRITICAL_FIXES_SUMMARY.md>)** - Technical analysis confirming all fixes present
+- **[`DOCS_AUDIT_SUMMARY.md`](<DOCS_AUDIT_SUMMARY.md>)** - Comprehensive audit verification
+
+---
+
+## ⚡ Co-op Troubleshooting Guide - Hosts and Clients
 
 ### Quick Decision Tree: Which Configuration Do I Need?
 
@@ -13,16 +49,16 @@ All P0 fixes (P0-a, P0-b, P0-c) are now properly documented and reflected in the
 │  What's Your Use Case?                                        │
 ├───────────────────────────────────────────────────────────────┤
 │                                                                │
-│  A) Casual co-op (2-4 players, same LAN or close network)      │
+│  A) Casual Co-op (2-4 players, same LAN or close network)      │
 │     → Use ZERO-COFIG DEFAULT: external_channel = false         │
 │     → No IP/port configuration needed!                         │
 │     → Just copy DLL and play ✅                                 │
 │                                                                │
-│  B) Large guild (6+ players, many bases)                       │
+│  B) Large Guild (6+ players, many bases)                       │
 │     → Enable external_channel = true                           │
 │     → Configure TCP channel as below                           │
 │                                                                │
-│  C) Dedicated server on separate machine                       │
+│  C) Dedicated Server on Separate Machine                       │
 │     → Enable external_channel = true                            │
 │     → Configure TCP channel with server IP                     │
 │                                                                │
@@ -100,9 +136,6 @@ Enable `external_channel = true` if you need:
    # 1. Open Command Prompt (cmd.exe)
    # 2. Run: ipconfig
    # 3. Look for "IPv4" under your active network adapter
-   #    Example: Ethernet adapter vEthernet:
-   #             IPv4 Address. . . . . . . . . : 192.168.1.10
-   #             Use this IP in external_server_host
    ```
 
 #### Finding Server's LAN IP (Windows):
@@ -189,7 +222,8 @@ New-NetFirewallRule -DisplayName "ISGATE TCP Channel" `
     -Direction Inbound `
     -Protocol TCP `
     -LocalPort 27500 `
-    -Action Allow
+    -Action Allow `
+    -Description "IntegratedStorageCpp external communication channel"
 
 # Verify rule was added
 Get-NetFirewallRule -DisplayName "ISGATE TCP Channel"
@@ -417,7 +451,6 @@ verbose = true  # Enables [ISGATE] diagnostic logs in UE4SS.log
 
 ### For Developers: Technical Deep Dives
 - **[`CRITICAL_FIXES_SUMMARY.md`](<CRITICAL_FIXES_SUMMARY.md>)** - Implementation details and architecture
-- **[`EXTERNAL_COM_CHANNEL_FEASIBILITY.md`](<EXTERNAL_COM_CHANNEL_FEASIBILITY.md>)** - Network design decisions
 - **[`DOCS_AUDIT_SUMMARY.md`](<DOCS_AUDIT_SUMMARY.md>)** - Documentation audit verification
 
 ---
@@ -434,4 +467,27 @@ verbose = true  # Enables [ISGATE] diagnostic logs in UE4SS.log
 
 ---
 
+## 📝 Zero-Config Default Mode
+
+### Why Zero-Config is the Default:
+
+Your fork uses `external_channel = false` by default because:
+1. **Most users don't need it:** 2-4 players work perfectly with RPC-based multiplayer
+2. **No troubleshooting required:** Just copy DLL and play
+3. **All P0 fixes still active:** Stability improvements work regardless of channel mode
+4. **Backwards compatible:** Falls back to tested original behavior seamlessly
+
+### When You Might Want Advanced Mode:
+
+Enable `external_channel = true` only if you need:
+- Large guilds (6+ concurrent players)
+- Dedicated servers on separate machines
+- Multiple bases with many items tracked
+- Zero buffer saturation under heavy load
+
+See the TCP Channel section above for configuration details.
+
+---
+
 **End of Usage Guide**
+<EOF>
