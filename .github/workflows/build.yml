@@ -76,7 +76,8 @@ jobs:
             # Check if mod is already added
             if ($content -notmatch [regex]::Escape($env:MOD_NAME)) {
               # Remove existing targetmods block and replace with updated version
-              $newTargetMods = "set targetmods {\"EventViewerMod\", \"$env:MOD_NAME\"}"
+              $escapedName = ('"' + $env:MOD_NAME + '"').Replace('"', '\"')
+              $newTargetMods = 'set targetmods {"EventViewerMod", "' + $escapedName + '"}'
               $content = $content.Replace(
                 'set targetmods {"EventViewerMod"}',
                 $newTargetMods
