@@ -424,8 +424,7 @@ static int64_t __fastcall hkAc0(void* a1, void* a2, void* r, void* o) {
     return reinterpret_cast<tAc0>(g_ac0.tramp)(a1, a2, r, o);
 }
 
-static const wchar_t* SRV_CHEST_CLASS = L"PalMapObjectItemChestModel";
-static const wchar_t* SRV_FOOD_CLASS = L"PalMapObjectPalFoodBoxModel";
+static const wchar_t* SRV_CHEST_CLASS = L"PalMapObjectItemChestModel"; // Food boxes excluded from cross-registration [FIX P0-c]
 
 struct GuildData {
     std::unordered_set<UObject*> storages, models;
@@ -436,6 +435,8 @@ struct GuildData {
 using FastGuidMap = std::unordered_map<FastGuidKey, UObject*, FastGuidHash>;
 
 static std::unordered_map<FastGuidKey, GuildData, FastGuidHash> g_guilds;
+// [FIX P0-b] Camp lookup cache from Si1ent-i base v4.1.2 - eliminates O(N) FindAllOf blocking
+// Uses g_campIdToCamp for O(1) camp enumeration instead of FindAllOf("PalBaseCampModel")
 static FastGuidMap g_instToCamp;
 static FastGuidMap g_instToCont;
 static FastGuidMap g_campIdToCamp;
@@ -507,7 +508,7 @@ static void srvDiscoverReconcileInner() {
         uint8_t* keyId = elems + (size_t)i * 0x20 + 0x00;
         UObject* model = *(UObject**)(elems + (size_t)i * 0x20 + 0x10);
         if (!model || !IsObjectValidFast(model)) continue;
-        if (!srvClassIs(model, SRV_CHEST_CLASS) && !srvClassIs(model, SRV_FOOD_CLASS)) continue;
+        if (!srvClassIs(model, SRV_CHEST_CLASS)) continue; // Skip food boxes [FIX P0-c]
         UObject* camp = srvCampModelOf(model); if (!camp) continue;
         
         GuildData& g = fresh[srvGuildKey(camp)];
@@ -990,14 +991,23 @@ static bool chClientTrigger(FastGuidKey& outKey) {
     outKey = campGuid; ++g_myCalls; return true;
 }
 
+// [FIX P0-a] hkEnterCamp - Add local player filter to prevent remote events from clearing client's pool
 static void hkEnterCamp(UnrealScriptFunctionCallableContext& ctx, void*) {
     if (!isClient(ctx.Context)) return;
+    // [FIX] Only clear pool for LOCAL player events, ignore remote player events
+    UObject* eventOwner = nullptr;
     if (ctx.Context) {
-        UObject* eventOwner = ctx.Context->GetOuterPrivate();
+        eventOwner = ctx.Context->GetOuterPrivate();
+        // Verify this is our local pawn's event, not a remote player's
         UObject* ctrl = GetLocalPlayerControllerFast();
         if (ctrl && eventOwner && IsObjectValidFast(eventOwner)) {
             if (!g_fnGetPawn) g_fnGetPawn = ctrl->GetFunctionByNameInChain(STR("K2_GetPawn"));
-            if (g_fnGetPawn) { struct { UObject* Ret; } pp{}; ctrl->ProcessEvent(g_fnGetPawn, &pp); if (pp.Ret && pp.Ret != eventOwner) return; }
+            if (g_fnGetPawn) {
+                struct { UObject* Ret; } pp{};
+                ctrl->ProcessEvent(g_fnGetPawn, &pp);
+                // [FIX] Only proceed if event owner matches our pawn
+                if (pp.Ret && pp.Ret != eventOwner) return;
+            }
         }
     }
     g_poolDirty.store(true); g_needTrigger.store(true);
