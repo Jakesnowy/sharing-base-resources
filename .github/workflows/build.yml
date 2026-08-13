@@ -58,29 +58,32 @@ jobs:
           Write-Host "Copying dllmain.cpp..."
           Copy-Item src\dllmain.cpp "$modDir\dllmain.cpp" -Force
           
-          # Copy xmake.lua if it exists in mod root (for standalone builds)
-          if (Test-Path "src\xmake.lua") {
-            $xmakeSrc = Join-Path (Get-Location) "src\xmake.lua"
-            $xmakeDst = Join-Path $modDir "xmake.lua"
-            Copy-Item $xmakeSrc $xmakeDst -Force
+          # Remove any existing xmake.lua to avoid conflicts
+          if (Test-Path "$modDir\xmake.lua") {
+            Remove-Item "$modDir\xmake.lua" -Force
+            Write-Host "Removed existing xmake.lua in mod directory"
           }
           
-          # Add to cppmods/xmake.lua
+          # Add to cppmods/xmake.lua using correct RE-UE4SS format
           $cppmodsXmake = Join-Path "RE-UE4SS\cppmods\xmake.lua"
           if (Test-Path $cppmodsXmake) {
             $content = Get-Content $cppmodsXmake -Raw
             
             # Check if mod is already added
             if ($content -notmatch [regex]::Escape($env:MOD_NAME)) {
+              # Remove existing targetmods block and replace with updated version
+              $newTargetMods = "set targetmods {"EventViewerMod", "$env:MOD_NAME"}"
               $content = $content.Replace(
                 'set targetmods {"EventViewerMod"}',
-                "set targetmods {"EventViewerMod"}" + "`n`n# Add JakeSnowy fork mod" + "`nset targetmods {"EventViewerMod"} `$env:MOD_NAME}"
+                $newTargetMods
               )
               Set-Content $cppmodsXmake $content -NoNewline
-              Write-Host "added $($env:MOD_NAME) to cppmods/xmake.lua"
+              Write-Host "Added $($env:MOD_NAME) to cppmods/xmake.lua"
             } else {
               Write-Host "$($env:MOD_NAME) already in targetmods, skipping"
             }
+          } else {
+            Write-Host "WARNING: RE-UE4SS/cppmods/xmake.lua not found - mod may not build correctly"
           }
           
           Write-Host "Mod injected into RE-UE4SS tree at $modDir"
@@ -107,6 +110,34 @@ jobs:
             throw "xmake build failed"
           }
 
+      - name: Verify built DLL exists and is valid
+        shell: pwsh
+        run: |
+          $buildDir = "RE-UE4SS\x64-windows_release\$env:MOD_NAME"
+          
+          if (-not (Test-Path $buildDir)) {
+            throw "ERROR: Build directory not found at $buildDir"
+          }
+          
+          $dll = Get-ChildItem -Path $buildDir -Recurse -Filter "$env:MOD_NAME.dll" -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -notlike "*\_deps\*" } |
+            Select-Object -First 1
+          
+          if (-not $dll) {
+            throw "ERROR: compiled $env:MOD_NAME.dll not found in build directory"
+          }
+          
+          Write-Host "Verified DLL:"
+          Write-Host "  File: $($dll.Name)"
+          Write-Host "  Size: $($_.Length) bytes"
+          Write-Host "  Path: $($dll.FullName)"
+          
+          # Verify it's a valid PE file
+          $bytes = [System.IO.File]::ReadAllBytes($dll.FullName)
+          if ($bytes.Length -lt 64) { throw "ERROR: DLL too small to be valid PE" }
+          
+          Write-Host "Verified: Valid PE executable"
+
       - name: Assemble installable mod package
         shell: pwsh
         run: |
@@ -114,20 +145,15 @@ jobs:
           $buildDir = "RE-UE4SS\x64-windows_release\$env:MOD_NAME"
           
           if (-not (Test-Path $buildDir)) {
-            # Try alternate build location
-            $buildDir = "RE-UE4SS\output\debug\dllmain_fixed\x64-windows_release\$env:MOD_NAME"
+            throw "ERROR: Build directory not found at $buildDir"
           }
           
           $dll = Get-ChildItem -Path $buildDir -Recurse -Filter "$env:MOD_NAME.dll" -ErrorAction SilentlyContinue |
             Where-Object { $_.FullName -notlike "*\_deps\*" } |
             Select-Object -First 1
-            
+          
           if (-not $dll) {
-            Write-Host "DLL not found at expected locations. All DLLs in RE-UE4SS:"
-            Get-ChildItem -Path "RE-UE4SS" -Recurse -Filter "*.dll" | ForEach-Object { 
-              Write-Host "  $($_.FullName)" 
-            }
-            throw "compiled $env:MOD_NAME.dll not found"
+            throw "ERROR: compiled $env:MOD_NAME.dll not found in build directory"
           }
           
           Write-Host "found dll: $($dll.FullName)"
@@ -140,16 +166,15 @@ jobs:
           Copy-Item $dll.FullName "$dist\dlls\main.dll" -Force
           
           # Copy enabled.txt (enables the mod)
-          $enabledTxt = Join-Path "RE-UE4SS\cppmods\$env:MOD_NAME\enabled.txt"
           New-Item -ItemType File -Force -Path "$dist\enabled.txt" | Out-Null
           
           # Use the repo's config.txt with full Chinese comments
           if (Test-Path "dist\$env:MOD_NAME\config.txt") {
             Copy-Item "dist\$env:MOD_NAME\config.txt" "$dist\config.txt" -Force
-            Write-Host "using repo config.txt (preserved)"
+            Write-Host "using config.txt from repository:"
+            Get-Content "dist\$env:MOD_NAME\config.txt" | ForEach-Object { Write-Host "  $_" }
           } else {
-            Write-Host "WARNING: dist/$($env:MOD_NAME)/config.txt missing -> creating empty"
-            New-Item -ItemType File -Force -Path "$dist\config.txt" | Out-Null
+            throw "ERROR: dist/$($env:MOD_NAME)/config.txt missing. Zero-config mode requires this file!"
           }
           
           # Create zip package for easy distribution
@@ -162,7 +187,10 @@ jobs:
           
           # List contents for verification
           Write-Host "`nPackage contents:"
-          Get-ChildItem "$dist" | ForEach-Object { Write-Host "  - $_.Name ($($_.Length) bytes)" }
+          Get-ChildItem "$dist" | ForEach-Object { 
+            $size = if ($_.Length -gt 0) { $_.Length } else { "N/A" }
+            Write-Host "  - $_.Name ($size bytes)" 
+          }
 
       - name: Upload mod zip artifact (primary distribution package)
         uses: actions/upload-artifact@v4
@@ -171,10 +199,4 @@ jobs:
           path: ${{ env.MOD_NAME }}.zip
           retention-days: 30
 
-      - name: Upload mod folder (secondary, for verification)
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: ${{ env.MOD_NAME }}
-          path: dist\${{ env.MOD_NAME }}
-          retention-days: 7
+<EOF>
