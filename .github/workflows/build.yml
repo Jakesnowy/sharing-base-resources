@@ -1,8 +1,8 @@
-name: Build Mod
+name: Build Mod (Optimized)
 
 # 云端编译 ModIntegratedStorageCpp —— 本地零依赖，push 即出 dll。
-# 使用 CMake 构建（匹配 RE-UE4SS 官方 CI），runner 自带 VS 2026 + MSVC 14.51。
-# RE-UE4SS 固定 commit c838a8ac（匹配已安装的 UE4SS v3.0.1 Beta）。
+# 使用 xmake 构建（原生 Windows 工具链，比 CMake + Ninja 更简单）
+# RE-UE4SS 固定 commit c838a8ac (匹配已安装的 UE4SS v3.0.1 Beta)
 
 on:
   push:
@@ -16,134 +16,165 @@ on:
 env:
   RE_UE4SS_COMMIT: c838a8acaade1a0f860bdf249f039e58f4e10088
   MOD_NAME: ModIntegratedStorageCpp
-  CONFIG: Game__Shipping__Win64
-
+  
 jobs:
   build:
     runs-on: windows-latest
+    timeout-minutes: 30  # Prevents hanging builds
+    
     steps:
       - name: Checkout mod source
         uses: actions/checkout@v4
-
-      - name: Setup MSVC Developer Command Prompt
+        
+      - name: Setup MSVC Developer Command Prompt (native, no CMake setup needed)
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
-          vsversion: "18"
-
-      - name: Setup CMake
-        uses: jwlawson/actions-setup-cmake@v2
-        with:
-          cmake-version: 'latest'
-
-      - name: Setup Ninja
-        uses: seanmiddleditch/gha-setup-ninja@v5
-
-      - name: Calculate cache key
-        id: cache_key
+          
+      - name: Clone RE-UE4SS (pinned commit, with submodules, HTTPS+PAT)
         shell: pwsh
         run: |
-          $commit = $env:RE_UE4SS_COMMIT
-          $week = Get-Date -Format 'yyyyWW'
-          echo "key=cmake-deps-${commit}-W${week}" >> $env:GITHUB_OUTPUT
-
-      - name: Cache CMake dependencies
-        uses: actions/cache@v4
-        with:
-          path: |
-            build_cmake_shared_deps/_deps
-            build_cmake_shared_deps/ep_downloads
-          key: ${{ steps.cache_key.outputs.key }}
-          restore-keys: |
-            cmake-deps-
-
-      - name: Clone RE-UE4SS (pinned commit, with submodules)
-        shell: pwsh
-        run: |
-          # submodule URLs use SSH; rewrite to HTTPS with PAT (UEPseudo is private)
+          # Setup git to use PAT for private submodule
           git config --global url."https://x-access-token:${{ secrets.GH_PAT }}@github.com/".insteadOf "git@github.com:"
+          
+          # Clone RE-UE4SS directly
+          Write-Host "Cloning RE-UE4SS..."
           git clone https://github.com/UE4SS-RE/RE-UE4SS.git RE-UE4SS
           Push-Location RE-UE4SS
           git checkout $env:RE_UE4SS_COMMIT
           git submodule update --init --recursive
           Pop-Location
+          Write-Host "RE-UE4SS cloned successfully"
 
-      - name: Inject mod into RE-UE4SS tree
+      - name: Inject mod into RE-UE4SS using xmake (native, no CMake)
         shell: pwsh
         run: |
           $modDir = "RE-UE4SS\cppmods\$env:MOD_NAME"
-          $srcDir = "$modDir\src"
-          New-Item -ItemType Directory -Force -Path $srcDir | Out-Null
-          Copy-Item src\CMakeLists.txt "$modDir\CMakeLists.txt" -Force
-          Copy-Item src\dllmain.cpp "$srcDir\dllmain.cpp" -Force
-          # Register mod in cppmods/CMakeLists.txt
-          $cppmodsCmake = "RE-UE4SS\cppmods\CMakeLists.txt"
-          $content = Get-Content $cppmodsCmake -Raw
-          if ($content -notmatch [regex]::Escape($env:MOD_NAME)) {
-              $content = $content.Replace(
-                  'add_subdirectory("EventViewerMod")',
-                  "add_subdirectory(`"EventViewerMod`")`nadd_subdirectory(`"$($env:MOD_NAME)`")"
-              )
-              Set-Content $cppmodsCmake $content
-              Write-Host "added add_subdirectory($($env:MOD_NAME)) to cppmods/CMakeLists.txt"
+          
+          # Create mod directory in RE-UE4SS cppmods tree
+          New-Item -ItemType Directory -Force -Path $modDir | Out-Null
+          
+          # Copy source files directly
+          Write-Host "Copying dllmain.cpp..."
+          Copy-Item src\dllmain.cpp "$modDir\dllmain.cpp" -Force
+          
+          # Copy xmake.lua if it exists in mod root (for standalone builds)
+          if (Test-Path "src\xmake.lua") {
+            $xmakeSrc = Join-Path (Get-Location) "src\xmake.lua"
+            $xmakeDst = Join-Path $modDir "xmake.lua"
+            Copy-Item $xmakeSrc $xmakeDst -Force
           }
-          Write-Host "mod injected into $modDir"
+          
+          # Add to cppmods/xmake.lua
+          $cppmodsXmake = Join-Path "RE-UE4SS\cppmods\xmake.lua"
+          if (Test-Path $cppmodsXmake) {
+            $content = Get-Content $cppmodsXmake -Raw
+            
+            # Check if mod is already added
+            if ($content -notmatch [regex]::Escape($env:MOD_NAME)) {
+              $content = $content.Replace(
+                'set targetmods {"EventViewerMod"}',
+                "set targetmods {"EventViewerMod"}" + "`n`n# Add JakeSnowy fork mod" + "`nset targetmods {"EventViewerMod"} `$env:MOD_NAME}"
+              )
+              Set-Content $cppmodsXmake $content -NoNewline
+              Write-Host "added $($env:MOD_NAME) to cppmods/xmake.lua"
+            } else {
+              Write-Host "$($env:MOD_NAME) already in targetmods, skipping"
+            }
+          }
+          
+          Write-Host "Mod injected into RE-UE4SS tree at $modDir"
 
-      - name: Configure CMake
+      - name: Build mod with xmake (native, fast Windows toolchain)
         shell: pwsh
         run: |
-          $env:FETCHCONTENT_BASE_DIR = "${{ github.workspace }}/build_cmake_shared_deps/_deps"
-          cmake -B build_cmake_msvc_$env:CONFIG `
-            -S RE-UE4SS `
-            -G Ninja `
-            -DCMAKE_BUILD_TYPE="$env:CONFIG" `
-            -DCMAKE_C_COMPILER="cl" `
-            -DCMAKE_CXX_COMPILER="cl" `
-            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON `
-            -DFETCHCONTENT_QUIET=OFF
+          Set-Location "RE-UE4SS"
+          $modName = $env:MOD_NAME
+          
+          # Configure xmake for the mod
+          Write-Host "Configuring $modName with xmake..."
+          .\xmake f -p windows -a x64 --target=$modName -y
+          
+          if ($LASTEXITCODE -ne 0) {
+            throw "xmake configuration failed"
+          }
+          
+          # Build the mod DLL
+          Write-Host "Building $modName..."
+          .\xmake build -v -t $modName
+          
+          if ($LASTEXITCODE -ne 0) {
+            throw "xmake build failed"
+          }
 
-      - name: Build mod
+      - name: Assemble installable mod package
         shell: pwsh
         run: |
-          cmake --build build_cmake_msvc_$env:CONFIG --target $env:MOD_NAME --verbose
-
-      - name: Assemble installable mod
-        shell: pwsh
-        run: |
-          $buildDir = "build_cmake_msvc_$env:CONFIG"
+          # Find the built DLL
+          $buildDir = "RE-UE4SS\x64-windows_release\$env:MOD_NAME"
+          
+          if (-not (Test-Path $buildDir)) {
+            # Try alternate build location
+            $buildDir = "RE-UE4SS\output\debug\dllmain_fixed\x64-windows_release\$env:MOD_NAME"
+          }
+          
           $dll = Get-ChildItem -Path $buildDir -Recurse -Filter "$env:MOD_NAME.dll" -ErrorAction SilentlyContinue |
             Where-Object { $_.FullName -notlike "*\_deps\*" } |
             Select-Object -First 1
+            
           if (-not $dll) {
-            Write-Host "DLL not found. All DLLs in build dir:"
-            Get-ChildItem -Path $buildDir -Recurse -Filter "*.dll" | ForEach-Object { Write-Host "  $($_.FullName)" }
+            Write-Host "DLL not found at expected locations. All DLLs in RE-UE4SS:"
+            Get-ChildItem -Path "RE-UE4SS" -Recurse -Filter "*.dll" | ForEach-Object { 
+              Write-Host "  $($_.FullName)" 
+            }
             throw "compiled $env:MOD_NAME.dll not found"
           }
+          
           Write-Host "found dll: $($dll.FullName)"
+          
+          # Create installable package structure
           $dist = "dist\$env:MOD_NAME"
           New-Item -ItemType Directory -Force -Path "$dist\dlls" | Out-Null
+          
+          # Copy DLL to dlls directory
           Copy-Item $dll.FullName "$dist\dlls\main.dll" -Force
+          
+          # Copy enabled.txt (enables the mod)
+          $enabledTxt = Join-Path "RE-UE4SS\cppmods\$env:MOD_NAME\enabled.txt"
           New-Item -ItemType File -Force -Path "$dist\enabled.txt" | Out-Null
-          # Use the repo's config.txt (with full Chinese comments) instead of an empty file,
-          # so users get an explained config in the packaged artifact.
-          if (Test-Path "$dist\config.txt") {
+          
+          # Use the repo's config.txt with full Chinese comments
+          if (Test-Path "dist\$env:MOD_NAME\config.txt") {
+            Copy-Item "dist\$env:MOD_NAME\config.txt" "$dist\config.txt" -Force
             Write-Host "using repo config.txt (preserved)"
           } else {
-            Write-Host "WARNING: dist/$env:MOD_NAME/config.txt missing in repo -> creating empty"
+            Write-Host "WARNING: dist/$($env:MOD_NAME)/config.txt missing -> creating empty"
             New-Item -ItemType File -Force -Path "$dist\config.txt" | Out-Null
           }
+          
+          # Create zip package for easy distribution
           if (Test-Path "$env:MOD_NAME.zip") { Remove-Item "$env:MOD_NAME.zip" -Force }
           Compress-Archive -Path "$dist\*" -DestinationPath "$env:MOD_NAME.zip" -Force
-          Write-Host "assembled $dist + $env:MOD_NAME.zip"
+          
+          Write-Host "Created package:"
+          Write-Host "  dist\$($env:MOD_NAME) (folder)"
+          Write-Host "  $env:MOD_NAME.zip (compressed package)"
+          
+          # List contents for verification
+          Write-Host "`nPackage contents:"
+          Get-ChildItem "$dist" | ForEach-Object { Write-Host "  - $_.Name ($($_.Length) bytes)" }
 
-      - name: Upload mod folder
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ env.MOD_NAME }}
-          path: dist\${{ env.MOD_NAME }}
-
-      - name: Upload zip
+      - name: Upload mod zip artifact (primary distribution package)
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.MOD_NAME }}.zip
           path: ${{ env.MOD_NAME }}.zip
+          retention-days: 30
+
+      - name: Upload mod folder (secondary, for verification)
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ${{ env.MOD_NAME }}
+          path: dist\${{ env.MOD_NAME }}
+          retention-days: 7
