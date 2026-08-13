@@ -5,6 +5,7 @@
 #include <Windows.h>
 #include <cstdint>
 #include <cstring>
+#include <cwchar>
 #include <vector>
 #include <string>
 #include <string_view>
@@ -45,11 +46,11 @@ struct RawTArray { uint8_t* data; int32_t num; int32_t max; };
 
 static bool g_verbose = true;
 static uint64_t g_reconcileMs = 8000;
-static uint64_t g_isiRefreshMs = 1500;
-static bool g_extEnabled = true;
+static bool g_extEnabled = false;
 static uint16_t g_extPort = 27500;
 static std::string g_extHost = "";
 static bool g_chDelta = true;
+static bool g_clientInjectEnabled = true;
 static uint64_t g_chFullSyncMs = 3600000;
 
 static const uintptr_t OFF_INV_MYINFO = 0x100;
@@ -113,6 +114,9 @@ static UObject* g_palUtil = nullptr;
 static UFunction* g_fnIsDedicatedServer = nullptr;
 static UFunction* g_fnIsServer = nullptr;
 
+static std::mutex g_roleMutex;
+static uint64_t g_lastRoleCheck = 0;
+
 static bool callUtilBool(const CharType* fnName, UFunction*& cachedFn, void* wc, bool* faulted = nullptr) {
     if (faulted) *faulted = false;
     if (!wc || !IsObjectValidFast((UObject*)wc)) { if (faulted) *faulted = true; return false; }
@@ -131,12 +135,25 @@ static bool callUtilBool(const CharType* fnName, UFunction*& cachedFn, void* wc,
 }
 
 static void ensureRole(void* wc) {
-    if (g_isSrv >= 0 || !wc) return;
+    if (!wc) return;
+    std::lock_guard<std::mutex> lock(g_roleMutex);
+    if (g_isSrv >= 0) return;
+    uint64_t now = GetTickCount64();
+    if (now - g_lastRoleCheck < 2000) return;
+    g_lastRoleCheck = now;
     g_isDedi = callUtilBool(STR("IsDedicatedServer"), g_fnIsDedicatedServer, wc) ? 1 : 0;
     bool faulted = false;
     g_isSrv = callUtilBool(STR("IsServer"), g_fnIsServer, wc, &faulted) ? 1 : 0;
-    if (faulted) { if (g_isDedi == 1) g_isSrv = 1; else g_isSrv = -1; return; }
-    if (g_isDedi == 1 && g_isSrv == 0) { g_isSrv = 1; return; }
+    if (faulted) { if (g_isDedi == 1) g_isSrv = 1; else return; }
+    if (g_isDedi == 1 && g_isSrv == 0) { g_isSrv = 1; }
+    if (g_isSrv >= 0) {
+        std::wstring msg = STR("[ISGATE] Role determined: server=");
+        msg += (g_isSrv ? STR("true") : STR("false"));
+        msg += STR(" dedicated=");
+        msg += (g_isDedi ? STR("true") : STR("false"));
+        msg += STR("\n");
+        Output::send<LogLevel::Verbose>(msg.c_str());
+    }
 }
 
 static UObject* g_cachedPlayerCharacter = nullptr;
@@ -227,7 +244,15 @@ static void mintPoolSlots() {
     size_t reqNum = 0;
     for (auto& kv : g_pool) if (kv.second > 0) reqNum++;
 
-    if (g_mintedSlots.size() != reqNum) {
+    // If size differs or any existing slot became invalid, rebuild from scratch.
+    bool needRebuild = (g_mintedSlots.size() != reqNum);
+    if (!needRebuild) {
+        for (UObject* s : g_mintedSlots) {
+            if (!s || !IsObjectValidFast(s)) { needRebuild = true; break; }
+        }
+    }
+
+    if (needRebuild) {
         for (UObject* s : g_mintedSlots) if (s && IsObjectValidFast(s)) s->ClearRootSet();
         g_mintedSlots.clear();
         g_mintedSlots.reserve(reqNum);
@@ -241,12 +266,10 @@ static void mintPoolSlots() {
         size_t idx = 0;
         for (auto& kv : g_pool) {
             if (kv.second <= 0) continue;
-            if (idx < g_mintedSlots.size()) {
-                UObject* s = g_mintedSlots[idx++];
-                if (s && IsObjectValidFast(s)) {
-                    *(FName*)((uint8_t*)s + OFF_SLOT_ITEMID) = kv.first;
-                    *(int32_t*)((uint8_t*)s + OFF_SLOT_COUNT) = kv.second;
-                }
+            UObject* s = g_mintedSlots[idx++];
+            if (s && IsObjectValidFast(s)) {
+                *(FName*)((uint8_t*)s + OFF_SLOT_ITEMID) = kv.first;
+                *(int32_t*)((uint8_t*)s + OFF_SLOT_COUNT) = kv.second;
             }
         }
     }
@@ -264,7 +287,7 @@ static void injectMintedFast() {
     if (!dc || !IsObjectValidFast(dc)) return;
     
     RawTArray* slots = (RawTArray*)((uint8_t*)dc + OFF_CONT_SLOTS);
-    if (slots->num < 0 || slots->num > 4096) return;
+    if (!slots || slots->num < 0 || slots->num > 4096 || !slots->data) return;
     g_savedDonorArr = *slots;
     
     bool needStamp = g_mintStampDirty || (g_savedDonorArr.num != g_lastStampRealNum);
@@ -293,9 +316,9 @@ static void injectMintedFast() {
 
 static void restoreMinted() {
     if (!g_swapped2) return;
-    if (g_swapDonor && IsObjectValidFast(g_swapDonor)) {
+    if (g_swapDonor && IsObjectValidFast(g_swapDonor) && g_savedDonorArr.data) {
         RawTArray* slots = (RawTArray*)((uint8_t*)g_swapDonor + OFF_CONT_SLOTS);
-        *slots = g_savedDonorArr;
+        if (slots) *slots = g_savedDonorArr;
     }
     g_swapDonor = nullptr; g_swapped2 = false;
 }
@@ -405,21 +428,21 @@ static Target g_ac0 = { STR("placement"), SIG_PLACEMENT, 0, nullptr, false, 0 };
 
 typedef int64_t(__fastcall* tCollect)(void*, void*, void*, uint8_t);
 static int64_t __fastcall hkCollect(void* c, void* r, void* o, uint8_t t) {
-    if (!isClient(c)) return reinterpret_cast<tCollect>(g_collect.tramp)(c, r, o, t);
+    if (!g_clientInjectEnabled || !isClient(c)) return reinterpret_cast<tCollect>(g_collect.tramp)(c, r, o, t);
     ScopedContainerInject injectGuard(c);
     return reinterpret_cast<tCollect>(g_collect.tramp)(c, r, o, t);
 }
 
 typedef int64_t(__fastcall* t7d0)(void*, void*, void*);
 static int64_t __fastcall hk7d0(void* a1, void* a2, void* o) {
-    if (!isClient(a1)) return reinterpret_cast<t7d0>(g_7d0.tramp)(a1, a2, o);
+    if (!g_clientInjectEnabled || !isClient(a1)) return reinterpret_cast<t7d0>(g_7d0.tramp)(a1, a2, o);
     ScopedContainerInject injectGuard(a1);
     return reinterpret_cast<t7d0>(g_7d0.tramp)(a1, a2, o);
 }
 
 typedef int64_t(__fastcall* tAc0)(void*, void*, void*, void*);
 static int64_t __fastcall hkAc0(void* a1, void* a2, void* r, void* o) {
-    if (!isClient(a1)) return reinterpret_cast<tAc0>(g_ac0.tramp)(a1, a2, r, o);
+    if (!g_clientInjectEnabled || !isClient(a1)) return reinterpret_cast<tAc0>(g_ac0.tramp)(a1, a2, r, o);
     ScopedContainerInject injectGuard(a1);
     return reinterpret_cast<tAc0>(g_ac0.tramp)(a1, a2, r, o);
 }
@@ -441,12 +464,35 @@ static FastGuidMap g_instToCamp;
 static FastGuidMap g_instToCont;
 static FastGuidMap g_campIdToCamp;
 static std::unordered_map<UObject*, std::unordered_set<UObject*>> g_registered;
+static UStruct* g_cachedChestClass = nullptr;
+static UStruct* g_cachedStorageModuleClass = nullptr;
 static bool g_srvInjecting = false;
+// Per-camp aggregated item totals, rebuilt during reconcile to make srvBuildForCamp O(camps) instead of O(chests).
+// Keyed by camp UObject* because the totals are only valid for the current reconcile cycle.
+static std::unordered_map<UObject*, std::unordered_map<std::string, int64_t>> g_campTotals;
 
 static bool srvClassIs(UObject* o, const wchar_t* name) {
     if (!o || !IsObjectValidFast(o)) return false;
     UStruct* c = (UStruct*)o->GetClassPrivate();
-    for (int i = 0; c && i < 24; ++i) { if (c->GetName() == name) return true; c = c->GetSuperStruct(); }
+    if (!c) return false;
+    // Fast path: cache the class pointer for known names after first lookup.
+    // Invalidated on world change via resetState to handle class reloads.
+    UStruct** cached = nullptr;
+    if (name == SRV_CHEST_CLASS) cached = &g_cachedChestClass;
+    else if (std::wcscmp(name, L"PalBaseCampModuleItemStorage") == 0) cached = &g_cachedStorageModuleClass;
+    if (cached && *cached) {
+        for (UStruct* walk = c; walk; walk = walk->GetSuperStruct()) {
+            if (walk == *cached) return true;
+        }
+        return false;
+    }
+    for (int i = 0; c && i < 24; ++i) {
+        if (c->GetName() == name) {
+            if (cached) *cached = c;
+            return true;
+        }
+        c = c->GetSuperStruct();
+    }
     return false;
 }
 
@@ -593,6 +639,28 @@ static void srvDiscoverReconcileInner() {
     }
     g_srvInjecting = false;
     
+    // Build per-camp item totals so replying to clients is O(camps) not O(chest instances).
+    std::unordered_map<UObject*, std::unordered_map<std::string, int64_t>> newTotals;
+    for (auto& kv : freshInst) {
+        auto cit = freshCont.find(kv.first);
+        if (cit == freshCont.end()) continue;
+        UObject* cont = cit->second;
+        UObject* camp = kv.second;
+        if (!camp || !IsObjectValidFast(camp) || !cont || !IsObjectValidFast(cont)) continue;
+        RawTArray* slots = (RawTArray*)((uint8_t*)cont + OFF_CONT_SLOTS);
+        if (!slots->data || slots->num <= 0 || slots->num > 4096) continue;
+        auto& total = newTotals[camp];
+        for (int i = 0; i < slots->num; ++i) {
+            UObject* slot = ((UObject**)slots->data)[i]; if (!slot || !IsObjectValidFast(slot)) continue;
+            int32_t cnt = *(int32_t*)((uint8_t*)slot + OFF_SLOT_COUNT); if (cnt <= 0) continue;
+            FName id = *(FName*)((uint8_t*)slot + OFF_SLOT_ITEMID);
+            RC::StringType wnameStr = id.ToString();
+            std::string nameStr(wnameStr.begin(), wnameStr.end());
+            total[nameStr] += cnt;
+        }
+    }
+    g_campTotals = std::move(newTotals);
+    
     g_guilds = std::move(fresh);
     g_instToCamp = std::move(freshInst);
     g_instToCont = std::move(freshCont);
@@ -623,24 +691,12 @@ static void srvBuildForCamp(UObject* camp, std::string& out) {
     std::unordered_map<std::string, int64_t> totalMap;
     totalMap.reserve(128);
     
-    for (auto& kv : g_instToCamp) {
-        UObject* ccamp = kv.second;
-        if (ccamp == camp || srvGuildKey(ccamp) != playerGuild) continue;
-        auto cit = g_instToCont.find(kv.first); if (cit == g_instToCont.end()) continue;
-        UObject* c = cit->second; if (!c || !IsObjectValidFast(c)) continue;
-        
-        RawTArray* slots = (RawTArray*)((uint8_t*)c + OFF_CONT_SLOTS);
-        if (!slots->data || slots->num <= 0 || slots->num > 4096) continue;
-        
-        for (int i = 0; i < slots->num; ++i) {
-            UObject* slot = ((UObject**)slots->data)[i]; if (!slot || !IsObjectValidFast(slot)) continue;
-            int32_t cnt = *(int32_t*)((uint8_t*)slot + OFF_SLOT_COUNT); if (cnt <= 0) continue;
-            FName id = *(FName*)((uint8_t*)slot + OFF_SLOT_ITEMID);
-            
-            RC::StringType wnameStr = id.ToString();
-            std::string nameStr(wnameStr.begin(), wnameStr.end());
-            totalMap[nameStr] += cnt;
-        }
+    // Use pre-computed per-camp totals from reconcile instead of scanning every chest instance.
+    for (auto& kv : g_campTotals) {
+        if (kv.first == camp) continue;
+        if (!kv.first || !IsObjectValidFast(kv.first)) continue;
+        if (srvGuildKey(kv.first) != playerGuild) continue;
+        for (auto& item : kv.second) totalMap[item.first] += item.second;
     }
     
     char countBuf[32];
@@ -899,9 +955,12 @@ static void netClientThread() {
     }
 }
 
-static void netStart() {
-    if (!g_extEnabled) return;
-    WSADATA wsa; if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return;
+static bool netStart() {
+    if (!g_extEnabled) return false;
+    WSADATA wsa; if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+        Output::send<LogLevel::Error>(STR("[ISGATE] WSAStartup failed, external channel disabled\n"));
+        return false;
+    }
     g_netRun.store(true);
     if (g_isSrv == 1) {
         g_listenSock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -910,11 +969,31 @@ static void netStart() {
             sockaddr_in sa{}; sa.sin_family = AF_INET; sa.sin_addr.s_addr = htonl(INADDR_ANY); sa.sin_port = htons(g_extPort);
             if (bind(g_listenSock, (sockaddr*)&sa, sizeof(sa)) != SOCKET_ERROR && listen(g_listenSock, 8) != SOCKET_ERROR) {
                 ConfigureSocketFast(g_listenSock); g_netThread = std::thread(netServerThread);
-            } else { closesocket(g_listenSock); g_listenSock = INVALID_SOCKET; }
+                std::wstring msg = STR("[ISGATE] TCP server listening on port ");
+                msg += std::to_wstring(g_extPort);
+                msg += STR("\n");
+                Output::send<LogLevel::Verbose>(msg.c_str());
+                return true;
+            } else {
+                std::wstring msg = STR("[ISGATE] Failed to bind TCP server to port ");
+                msg += std::to_wstring(g_extPort);
+                msg += STR("\n");
+                Output::send<LogLevel::Error>(msg.c_str());
+                closesocket(g_listenSock); g_listenSock = INVALID_SOCKET;
+            }
         }
     } else if (g_isSrv == 0 && !g_extHost.empty()) {
         g_netThread = std::thread(netClientThread);
+        std::wstring msg = STR("[ISGATE] TCP client thread started for ");
+        msg += std::wstring(g_extHost.begin(), g_extHost.end());
+        msg += STR(":");
+        msg += std::to_wstring(g_extPort);
+        msg += STR("\n");
+        Output::send<LogLevel::Verbose>(msg.c_str());
+        return true;
     }
+    WSACleanup();
+    return false;
 }
 
 static void netStop() {
@@ -936,9 +1015,11 @@ inline UObject* GetLocalPlayerControllerFast() {
     return g_CachedPlayerController;
 }
 
+static std::mutex g_campMutex;
 static bool clientInCamp() {
-    static uint64_t s_last = 0; static bool s_cached = false;
     uint64_t now = GetTickCount64();
+    std::lock_guard<std::mutex> lock(g_campMutex);
+    static uint64_t s_last = 0; static bool s_cached = false;
     if (s_last != 0 && now - s_last < 500) return s_cached;
     s_last = now;
     
@@ -1046,7 +1127,8 @@ static void installChannel() {
 
 static UObject* g_lastWorld = nullptr;
 static void resetState() {
-    g_guilds.clear(); g_instToCamp.clear(); g_instToCont.clear(); g_campIdToCamp.clear(); g_registered.clear();
+    g_guilds.clear(); g_instToCamp.clear(); g_instToCont.clear(); g_campIdToCamp.clear(); g_registered.clear(); g_campTotals.clear();
+    g_cachedChestClass = nullptr; g_cachedStorageModuleClass = nullptr;
     for (UObject* s : g_mintedSlots) if (s && IsObjectValidFast(s)) s->ClearRootSet();
     g_mintedSlots.clear(); g_common = nullptr; g_donorCont = nullptr; g_pool.clear();
     g_cliForceReconnect.store(true); g_swapped2 = false; g_swapDonor = nullptr; g_swapBuf.clear();
@@ -1055,6 +1137,8 @@ static void resetState() {
     g_consecMiss = 0; g_missLogged = 0; g_lastFetchOk = 0; g_inCampStable = false; g_inCampStreak = 0;
     g_inCampLastSampleAt = 0; g_inCampHook = false; g_inCampHookKnown = false; g_isSrv = -1; g_lastWc = nullptr;
     g_cachedMapObjectMgr = nullptr; g_cachedBaseCampMgr = nullptr; g_cachedItemContMgr = nullptr;
+    g_cachedInventoryData = nullptr;
+    g_itemUtilCdo = nullptr; g_createSlotFn = nullptr;
     g_fnGetBaseCampIds = nullptr; g_fnTryGetModel = nullptr; g_CachedPlayerController = nullptr;
     g_fnGetPawn = nullptr; g_fnIsInsideBaseCamp = nullptr; g_cachedPlayerCharacter = nullptr;
     
@@ -1115,6 +1199,7 @@ static void loadConfig() {
         }
         else if (key == "external_server_host") g_extHost = std::string(val);
         else if (key == "channel_delta") g_chDelta = (val == "true" || val == "1");
+        else if (key == "client_inject_enabled") g_clientInjectEnabled = (val == "true" || val == "1");
         else if (key == "channel_full_sync_interval") {
             uint64_t v = 0;
             if (std::from_chars(val.data(), val.data() + val.size(), v).ec == std::errc() && v >= 5000) g_chFullSyncMs = v;
@@ -1125,7 +1210,7 @@ static void loadConfig() {
 class ModIntegratedStorageCpp : public CppUserModBase {
 public:
     ModIntegratedStorageCpp() : CppUserModBase() {
-        ModName = STR("IntegratedStorageCpp"); ModVersion = STR("4.1.2");
+        ModName = STR("IntegratedStorageCpp"); ModVersion = STR("4.1.2-audited");
     }
     ~ModIntegratedStorageCpp() override {
         netStop();
@@ -1135,7 +1220,41 @@ public:
     auto on_unreal_init() -> void override {
         loadConfig();
         initExecRanges((uintptr_t)GetModuleHandleW(nullptr));
-        auto maybe = [&](bool en, Target& t, uint64_t cb) { if (en) { scanSig(parseSig(t.sig), new int); t.det = new PLH::x64Detour(t.addr, cb, &t.tramp); t.hooked = t.det->hook(); } };
+        Output::send<LogLevel::Normal>(STR("[ISGATE] === IntegratedStorageCpp v4.1.2-audited loaded ===\n"));
+        {
+            std::wstring msg = STR("[ISGATE] external_channel=");
+            msg += (g_extEnabled ? STR("true") : STR("false"));
+            msg += STR(" client_inject=");
+            msg += (g_clientInjectEnabled ? STR("true") : STR("false"));
+            msg += STR("\n");
+            Output::send<LogLevel::Verbose>(msg.c_str());
+        }
+        auto maybe = [&](bool en, Target& t, uint64_t cb) {
+            if (!en) return;
+            int count = 0;
+            t.addr = scanSig(parseSig(t.sig), &count);
+            if (!t.addr) {
+                std::wstring msg = STR("[ISGATE] Failed to find signature for ");
+                msg += t.name;
+                msg += STR("\n");
+                Output::send<LogLevel::Error>(msg.c_str());
+                return;
+            }
+            if (count != 1) {
+                std::wstring msg = STR("[ISGATE] Signature for ");
+                msg += t.name;
+                msg += STR(" matched multiple times, using first match\n");
+                Output::send<LogLevel::Warning>(msg.c_str());
+            }
+            t.det = new PLH::x64Detour(t.addr, cb, &t.tramp);
+            t.hooked = t.det->hook();
+            {
+                std::wstring msg = STR("[ISGATE] Hooked ");
+                msg += t.name;
+                msg += t.hooked ? STR(" OK\n") : STR(" FAILED\n");
+                Output::send<LogLevel::Verbose>(msg.c_str());
+            }
+        };
         maybe(true, g_collect, (uint64_t)&hkCollect);
         maybe(true, g_7d0, (uint64_t)&hk7d0);
         maybe(true, g_ac0, (uint64_t)&hkAc0);
@@ -1152,9 +1271,10 @@ public:
             checkWorld(g_cachedPlayerCharacter); 
         }
         if (g_isSrv < 0) { isClient(); return; }
-        if (!g_netStarted) { g_netStarted = true; netStart(); }
+        if (!g_netStarted) { g_netStarted = netStart(); }
         
         if (g_isSrv == 0) {
+            if (!g_clientInjectEnabled) return;
             if (g_poolDirty.exchange(false)) mintPoolSlots(); 
             
             if (g_CliInboundRep.Ready.load(std::memory_order_acquire)) {

@@ -1,5 +1,5 @@
 # ============================================================================
-#  IntegratedStorage - JakeSnowy Fork v4.1.2-fixes (Zero-Config Default)
+#  IntegratedStorage - JakeSnowy Fork v4.1.2-audited (Zero-Config Default)
 #  GitHub: https://github.com/Jakesnowy/sharing-base-resources
 #  Base: Sarfflow's IntegratedStorageCpp v4.1.2 with P0 Critical Fixes
 # ============================================================================
@@ -115,4 +115,18 @@ channel_full_sync_interval = 3600000
 # channel_delay_reply : Enable delayed reply to reentrancy protection.
 #                       Default: false (disable for normal use)
 channel_delay_reply = false
+
+# ============================================================================
+#  HOST-ONLY / DEVELOPER OPTION
+# ============================================================================
+# client_inject_enabled : Controls whether this machine performs client-side
+#                         UI injection (minted slots) to show shared items.
+#   - true (default): Normal behavior. REQUIRED on clients so they can see
+#     the shared material pool in crafting/building UIs.
+#   - false: Server-side cross-registration only. For developers testing whether
+#     Palworld's native replication already shows shared items to unmodded
+#     clients. End users should leave this enabled.
+# IMPORTANT: This mod currently MUST be installed on every client for the
+# shared pool to be visible. Host-only deployment is not yet supported.
+client_inject_enabled = true
 

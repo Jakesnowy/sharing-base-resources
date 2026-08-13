@@ -1,4 +1,6 @@
-# IntegratedStorageCpp v4.1.2-fixes (Critical Multiplayer Stable Fork)
+# IntegratedStorageCpp v4.1.2-audited (Critical Multiplayer Stable Fork)
+
+> **Audit update (2026-08-13):** This version fixes a critical signature-scan bug that prevented the client-side UI hooks from being installed. It also hardens role detection, container injection, and server-side reply performance. See [`AUDIT_v4.1.2-audited.md`](AUDIT_v4.1.2-audited.md) for the full report.
 
 ## 🚀 Easy Deployment - Zero Configuration Mode!
 
@@ -7,6 +9,8 @@
 1. **Clone fork and build DLL** (one time setup)
 2. **Copy DLL to every machine** (server + all clients)
 3. **Play!** No IP/port/firewall configuration needed!
+
+**Important:** Because the shared pool is shown through client-side UI injection, the mod must currently be installed on **every client**. Host-only deployment is not supported in this architecture. A new config option `client_inject_enabled` lets developers test server-only cross-registration, but end users should leave it enabled.
 
 The fork uses **Zero-Config Default Mode** for simplicity:
 - ✅ Works out-of-the-box with original RPC-based multiplayer  

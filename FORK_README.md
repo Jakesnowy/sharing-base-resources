@@ -1,7 +1,10 @@
 # IntegratedStorageCpp - JakeSnowy Fork Quick Reference Guide
 **GitHub:** https://github.com/Jakesnowy/sharing-base-resources  
 **Base Version:** Sarfflow's IntegratedStorageCpp v4.1.2 with P0 fixes + TCP/B3+B4 optimizations  
+**Current Version:** v4.1.2-audited  
 **Deployment Mode:** ✅ **Zero-Config Default (External Channel Disabled)**
+
+> **Audit update:** v4.1.2-audited fixes a critical signature-scan bug, hardens role detection and container injection, and optimizes server-side replies. See [`AUDIT_v4.1.2-audited.md`](AUDIT_v4.1.2-audited.md). The mod must still be installed on every client.
 
 ---
 

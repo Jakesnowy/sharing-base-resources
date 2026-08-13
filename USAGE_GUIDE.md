@@ -148,7 +148,7 @@ The default `config.txt` is optimized for zero-config deployment:
 
 ```ini
 # ============================================================================
-#  IntegratedStorage - JakeSnowy Fork v4.1.2-fixes (Zero-Config Default)
+#  IntegratedStorage - JakeSnowy Fork v4.1.2-audited (Zero-Config Default)
 #  GitHub: https://github.com/Jakesnowy/sharing-base-resources
 # ============================================================================
 
@@ -174,6 +174,12 @@ channel_full_sync_interval = 3600000
 
 # LAYER 3: Delay Reply (Optional reentrancy protection)
 channel_delay_reply = false
+
+# client_inject_enabled : Client-side UI injection switch. MUST stay `true`
+#                         on clients or the shared pool will not be visible.
+#                         Set to `false` only for developer testing of
+#                         server-only cross-registration.
+client_inject_enabled = true
 
 # ============================================================================
 #  ALL THREE P0 CRITICAL FIXES ARE ACTIVE REGARDLESS OF CHANNEL MODE:
@@ -221,6 +227,8 @@ Friends copy same DLL to their Palworld Mods folders
 - Clients use original RPC-based multiplayer for item requests
 - All P0 fixes active for stability
 - **Zero troubleshooting required** ✅
+
+**Note:** The mod must be installed on every client because the shared pool is injected into the client's UI. Host-only deployment is not currently possible with this architecture.
 
 ---
 
