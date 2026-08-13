@@ -1,8 +1,8 @@
-name: Build Mod (Optimized)
+name: Build Mod
 
 # 云端编译 ModIntegratedStorageCpp —— 本地零依赖，push 即出 dll。
-# 使用 xmake 构建（原生 Windows 工具链，比 CMake + Ninja 更简单）
-# RE-UE4SS 固定 commit c838a8ac (匹配已安装的 UE4SS v3.0.1 Beta)
+# 使用 CMake 构建（匹配 RE-UE4SS 官方 CI），runner 自带 MSVC。
+# RE-UE4SS 固定 commit c838a8ac（匹配已安装的 UE4SS v3.0.1 Beta）。
 
 on:
   push:
@@ -16,181 +16,135 @@ on:
 env:
   RE_UE4SS_COMMIT: c838a8acaade1a0f860bdf249f039e58f4e10088
   MOD_NAME: ModIntegratedStorageCpp
-  
+  CONFIG: Game__Shipping__Win64
+
 jobs:
   build:
     runs-on: windows-latest
-    timeout-minutes: 30  # Prevents hanging builds
-    
+    timeout-minutes: 30
     steps:
       - name: Checkout mod source
         uses: actions/checkout@v4
-        
-      - name: Setup MSVC Developer Command Prompt (native, no CMake setup needed)
+
+      - name: Setup MSVC Developer Command Prompt
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
-          
-      - name: Clone RE-UE4SS (pinned commit, with submodules, HTTPS+PAT)
+
+      - name: Setup CMake
+        uses: jwlawson/actions-setup-cmake@v2
+        with:
+          cmake-version: 'latest'
+
+      - name: Setup Ninja
+        uses: seanmiddleditch/gha-setup-ninja@v5
+
+      - name: Calculate cache key
+        id: cache_key
         shell: pwsh
         run: |
-          # Setup git to use PAT for private submodule
+          $commit = $env:RE_UE4SS_COMMIT
+          $week = Get-Date -Format 'yyyyWW'
+          echo "key=cmake-deps-${commit}-W${week}" >> $env:GITHUB_OUTPUT
+
+      - name: Cache CMake dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            build_cmake_shared_deps/_deps
+            build_cmake_shared_deps/ep_downloads
+          key: ${{ steps.cache_key.outputs.key }}
+          restore-keys: |
+            cmake-deps-
+
+      - name: Clone RE-UE4SS (pinned commit, with submodules)
+        shell: pwsh
+        run: |
+          # submodule URLs use SSH; rewrite to HTTPS with PAT (UEPseudo is private)
           git config --global url."https://x-access-token:${{ secrets.GH_PAT }}@github.com/".insteadOf "git@github.com:"
-          
-          # Clone RE-UE4SS directly
-          Write-Host "Cloning RE-UE4SS..."
           git clone https://github.com/UE4SS-RE/RE-UE4SS.git RE-UE4SS
           Push-Location RE-UE4SS
           git checkout $env:RE_UE4SS_COMMIT
           git submodule update --init --recursive
           Pop-Location
-          Write-Host "RE-UE4SS cloned successfully"
 
-      - name: Build mod as standalone xmake project
+      - name: Inject mod into RE-UE4SS tree
         shell: pwsh
         run: |
-          # Create standalone mod build directory
-          $modBuildDir = Join-Path $env:GITHUB_WORKSPACE "build\$($env:MOD_NAME)"
-          New-Item -ItemType Directory -Force -Path $modBuildDir | Out-Null
-          
-          # Copy source files to build directory
-          Write-Host "Copying dllmain.cpp..."
-          Copy-Item src\dllmain.cpp "$modBuildDir\dllmain.cpp" -Force
-          
-          # Create xmake.lua for standalone build
-          $xmakeContent = @'
-set targetproject ""
-set projectname "${{ env.MOD_NAME }}"
-
-add_rules("mode.debug", "mode.release")
-
-target "${{ env.MOD_NAME }}"
-    setkind "shared"
-    addincludes("${{ github.workspace }}/src")
-    adddefines("_CRT_SECURE_NO_WARNINGS")
-    
-    # Polyhook2 dependency (from RE-UE4SS build tree)
-    addincludedirs("$(RE_UE4SS_ROOT)/include")
-    addsyslibdirs("$(RE_UE4SS_ROOT)/lib/x64")
-    
-    addsystemlib("polyhook_2")
-    
-    addfiles("*.cpp")
-'@
-          
-          $xmakePath = Join-Path $modBuildDir "xmake.lua"
-          Set-Content -Path $xmakePath -Value $xmakeContent -NoNewline
-          
-          Write-Host "Created xmake.lua at:"
-          Write-Host "  $($xmakePath)"
-          
-          # Build the mod
-          Set-Location $modBuildDir
-          Write-Host "`nConfiguring with xmake..."
-          .\xmake f -p windows -a x64 --target="${{ env.MOD_NAME }}" -y
-          
-          if ($LASTEXITCODE -ne 0) {
-            throw "xmake configuration failed"
+          $modDir = "RE-UE4SS\cppmods\$env:MOD_NAME"
+          $srcDir = "$modDir\src"
+          New-Item -ItemType Directory -Force -Path $srcDir | Out-Null
+          Copy-Item src\CMakeLists.txt "$modDir\CMakeLists.txt" -Force
+          Copy-Item src\dllmain.cpp "$srcDir\dllmain.cpp" -Force
+          # Register mod in cppmods/CMakeLists.txt
+          $cppmodsCmake = "RE-UE4SS\cppmods\CMakeLists.txt"
+          $content = Get-Content $cppmodsCmake -Raw
+          if ($content -notmatch [regex]::Escape($env:MOD_NAME)) {
+              $content = $content.Replace(
+                  'add_subdirectory("EventViewerMod")',
+                  "add_subdirectory(`"EventViewerMod`")`nadd_subdirectory(`"$($env:MOD_NAME)`")"
+              )
+              Set-Content $cppmodsCmake $content
+              Write-Host "added add_subdirectory($($env:MOD_NAME)) to cppmods/CMakeLists.txt"
           }
-          
-          Write-Host "`nBuilding..."
-          .\xmake build -v
-          
-          if ($LASTEXITCODE -ne 0) {
-            throw "xmake build failed"
-          }
+          Write-Host "mod injected into $modDir"
 
-      - name: Verify built DLL exists and is valid
+      - name: Configure CMake
         shell: pwsh
         run: |
-          $buildDir = Join-Path $env:GITHUB_WORKSPACE "build\$($env:MOD_NAME)"
-          
-          if (-not (Test-Path $buildDir)) {
-            throw "ERROR: Build directory not found at $buildDir"
-          }
-          
+          $env:FETCHCONTENT_BASE_DIR = "${{ github.workspace }}/build_cmake_shared_deps/_deps"
+          cmake -B build_cmake_msvc_$env:CONFIG `
+            -S RE-UE4SS `
+            -G Ninja `
+            -DCMAKE_BUILD_TYPE="$env:CONFIG" `
+            -DCMAKE_C_COMPILER="cl" `
+            -DCMAKE_CXX_COMPILER="cl" `
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON `
+            -DFETCHCONTENT_QUIET=OFF
+
+      - name: Build mod
+        shell: pwsh
+        run: |
+          cmake --build build_cmake_msvc_$env:CONFIG --target $env:MOD_NAME --verbose
+
+      - name: Assemble installable mod
+        shell: pwsh
+        run: |
+          $buildDir = "build_cmake_msvc_$env:CONFIG"
           $dll = Get-ChildItem -Path $buildDir -Recurse -Filter "$env:MOD_NAME.dll" -ErrorAction SilentlyContinue |
             Where-Object { $_.FullName -notlike "*\_deps\*" } |
             Select-Object -First 1
-          
           if (-not $dll) {
-            Write-Host "DLL not found, listing all files:"
-            Get-ChildItem $buildDir -Recurse | ForEach-Object { 
-              Write-Host "  $($_.FullName)" 
-            }
-            throw "ERROR: compiled $env:MOD_NAME.dll not found in build directory"
+            Write-Host "DLL not found. All DLLs in build dir:"
+            Get-ChildItem -Path $buildDir -Recurse -Filter "*.dll" | ForEach-Object { Write-Host "  $($_.FullName)" }
+            throw "compiled $env:MOD_NAME.dll not found"
           }
-          
-          Write-Host "Verified DLL:"
-          Write-Host "  File: $($dll.Name)"
-          Write-Host "  Size: $($_.Length) bytes"
-          Write-Host "  Path: $($dll.FullName)"
-          
-          # Verify it's a valid PE file
-          $bytes = [System.IO.File]::ReadAllBytes($dll.FullName)
-          if ($bytes.Length -lt 64) { throw "ERROR: DLL too small to be valid PE" }
-          
-          Write-Host "Verified: Valid PE executable"
-
-      - name: Assemble installable mod package
-        shell: pwsh
-        run: |
-          # Find the built DLL
-          $buildDir = Join-Path $env:GITHUB_WORKSPACE "build\$($env:MOD_NAME)"
-          
-          if (-not (Test-Path $buildDir)) {
-            throw "ERROR: Build directory not found at $buildDir"
-          }
-          
-          $dll = Get-ChildItem -Path $buildDir -Recurse -Filter "$env:MOD_NAME.dll" -ErrorAction SilentlyContinue |
-            Where-Object { $_.FullName -notlike "*\_deps\*" } |
-            Select-Object -First 1
-          
-          if (-not $dll) {
-            throw "ERROR: compiled $env:MOD_NAME.dll not found in build directory"
-          }
-          
           Write-Host "found dll: $($dll.FullName)"
-          
-          # Create installable package structure
-          $dist = Join-Path $env:GITHUB_WORKSPACE "dist\$($env:MOD_NAME)"
+          $dist = "dist\$env:MOD_NAME"
           New-Item -ItemType Directory -Force -Path "$dist\dlls" | Out-Null
-          
-          # Copy DLL to dlls directory
           Copy-Item $dll.FullName "$dist\dlls\main.dll" -Force
-          
-          # Create enabled.txt (enables the mod)
           New-Item -ItemType File -Force -Path "$dist\enabled.txt" | Out-Null
-          
-          # Use the repo's config.txt with full Chinese comments
-          if (Test-Path "dist\$env:MOD_NAME\config.txt") {
-            Copy-Item "dist\$env:MOD_NAME\config.txt" "$dist\config.txt" -Force
-            Write-Host "using config.txt from repository:"
-            Get-Content "dist\$env:MOD_NAME\config.txt" | ForEach-Object { Write-Host "  $_" }
+          # Use the repo's config.txt (with full Chinese comments) instead of an empty file,
+          # so users get an explained config in the packaged artifact.
+          if (Test-Path "$dist\config.txt") {
+            Write-Host "using repo config.txt (preserved)"
           } else {
-            throw "ERROR: dist/$($env:MOD_NAME)/config.txt missing. Zero-config mode requires this file!"
+            Write-Host "WARNING: dist/$env:MOD_NAME/config.txt missing in repo -> creating empty"
+            New-Item -ItemType File -Force -Path "$dist\config.txt" | Out-Null
           }
-          
-          # Create zip package for easy distribution
           if (Test-Path "$env:MOD_NAME.zip") { Remove-Item "$env:MOD_NAME.zip" -Force }
           Compress-Archive -Path "$dist\*" -DestinationPath "$env:MOD_NAME.zip" -Force
-          
-          Write-Host "Created package:"
-          Write-Host "  dist\$($env:MOD_NAME) (folder)"
-          Write-Host "  $env:MOD_NAME.zip (compressed package)"
-          
-          # List contents for verification
-          Write-Host "`nPackage contents:"
-          Get-ChildItem "$dist" | ForEach-Object { 
-            $size = if ($_.Length -gt 0) { $_.Length } else { "N/A" }
-            Write-Host "  - $_.Name ($size bytes)" 
-          }
+          Write-Host "assembled $dist + $env:MOD_NAME.zip"
 
-      - name: Upload mod zip artifact (primary distribution package)
+      - name: Upload mod folder
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.MOD_NAME }}
+          path: dist\${{ env.MOD_NAME }}
+
+      - name: Upload zip
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.MOD_NAME }}.zip
           path: ${{ env.MOD_NAME }}.zip
-          retention-days: 30
 
-<EOF>

@@ -7,5 +7,5 @@ set(${TARGET}_Sources
         )
 
 add_library(${TARGET} SHARED ${${TARGET}_Sources})
-target_link_libraries(${TARGET} PRIVATE PolyHook_2)
+target_link_libraries(${TARGET} PRIVATE PolyHook_2 ws2_32)
 target_link_libraries(${TARGET} PUBLIC UE4SS)
