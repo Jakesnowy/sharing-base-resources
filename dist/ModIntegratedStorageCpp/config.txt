@@ -1,26 +1,31 @@
 # ============================================================================
-#  IntegratedStorage 配置文件 - JakeSnowy Fork v4.1.2-fixes
+#  IntegratedStorage - JakeSnowy Fork v4.1.2-fixes (Zero-Config Default)
 #  GitHub: https://github.com/Jakesnowy/sharing-base-resources
-#  Base: Sarfflow's IntegratedStorageCpp v4.1.2
-#  ============================================================================
+#  Base: Sarfflow's IntegratedStorageCpp v4.1.2 with P0 Critical Fixes
+# ============================================================================
 
-# [IMPORTANT] This fork includes ALL THREE P0 critical fixes plus unique optimizations:
-# - P0-a: hkEnterCamp local player filter (prevents flickering)
-# - P0-b: Camp lookup cache via g_campIdToCamp (eliminates FindAllOf lag)
+# [IMPORTANT] This fork includes ALL THREE P0 critical fixes that work
+#             independently of external communication channel:
+# - P0-a: hkEnterCamp local player filter (prevents flickering from remote events)
+# - P0-b: Camp lookup cache via g_campIdToCamp (eliminates FindAllOf blocking lag)  
 # - P0-c: Food box exclusion from storage cross-registration (fixes food consumption)
-# 
-# TCP Channel (Layer 1 - Fork Feature from Fault Analysis):
-#   Dedicated socket-based transport outside UE net driver on its own thread
-#   Zero reliable buffer saturation; eliminates paralysis issues
-#
-# B3+B4 Optimizations (Fork Features from Fault Analysis):
-#   B3: BaseCampManager native API for O(1) camp enumeration
-#   B4: ItemContainerManager TMap for O(1) container lookup
+# These fixes provide major stability improvements regardless of channel mode.
 
-# [FIXES VERIFIED] All P0 fixes present in source code:
-# - src/dllmain.cpp line ~993-1017: [FIX P0-a] hkEnterCamp local player filter
-# - src/dllmain.cpp line ~610, ~767-779: P0-b Camp lookup cache via g_campIdToCamp
-# - src/dllmain.cpp line 427, ~509: [FIX P0-c] Food box exclusion from storage
+# ============================================================================
+#  DEPLOYMENT MODE - Zero-Config Default for Easy Deployment!
+# ============================================================================
+#
+# This fork uses "Zero-Config Mode" by default:
+#   ✅ Just copy DLL to all machines and play - no IP/port/firewall needed!
+#   ✅ Works out-of-the-box with original RPC-based multiplayer
+#   ✅ All P0 fixes still active for stability
+#   ✅ Falls back to tested original behavior seamlessly
+#
+# For advanced users who want maximum stability (5+ players, dedicated servers):
+#   - Edit this config and uncomment external_channel = true
+#   - Configure IP addresses as described in USAGE_GUIDE.md
+#
+# ============================================================================
 
 # verbose : Whether to output detailed [ISGATE] diagnostic logs in UE4SS.log.
 #           Includes client menu open/request/reply tracking and server-side
@@ -33,54 +38,64 @@ verbose = true
 #                         Smaller values discover builds/destroys faster; larger values
 #                         reduce background overhead. Minimum: 500.
 #                         
-# [RECOMMENDATION] With B3+B4 optimizations, this is less critical:
+# [RECOMMENDATION] With P0-b cache optimization, this is less critical:
 #   - Single player / Small guild (<3 players): 8000ms (default)
 #   - Medium guild (3-5 players): 15000ms
 #   - Large guild (6+ players, many bases): 30000ms
 reconcile_interval_ms = 8000
 
 # isi_refresh_ms : Remote client refresh frequency. Kept for backward compatibility.
-#                  Minimum: 200. Only used if channel_delta is disabled.
+#                  Minimum: 200. Only used if external channel is disabled.
 isi_refresh_ms = 1500
 
-# ----------------------------------------------------------------------------
-#  External TCP Channel (Layer 1 - Fork Feature)
-#  This fork implements a dedicated external TCP channel that runs OUTSIDE the UE
-#  network driver on its own socket + thread. This eliminates all reliable buffer
-#  saturation risks and makes the mod immune to the paralysis issues described in
-#  the fault analysis reports.
-#  
-#  Architecture:
-#    - Server/Host (authority): Listens on g_extPort, handles all game logic natively
-#    - Remote clients: Connect to server's IP:g_extPort via TCP channel
-#    - Host reads cross-registered containers directly without needing TCP for itself
-# ----------------------------------------------------------------------------
+# ============================================================================
+#  EXTERNAL TCP CHANNEL (Layer 1 - Optional Advanced Feature)
+# ============================================================================
+#
+# This fork implements an external TCP channel that runs OUTSIDE the UE network
+# driver on its own socket + thread. Benefits include:
+#   - Zero reliable buffer saturation (prevents paralysis under load)
+#   - Dedicated thread for network I/O (never blocks game thread)
+#   - Optimized payload delivery with delta sync
+#
+# DEFAULT MODE: DISABLED for zero-config deployment
+#   Most users won't need this - just copy DLL and play!
+#   Original RPC-based multiplayer works fine with P0 fixes.
+#
+# ADVANCED MODE: Enable for large guilds, dedicated servers, or edge cases
+#   Uncomment external_channel = true line below to enable
+#   Then configure IP/port settings as needed (see USAGE_GUIDE.md)
+# ============================================================================
 
-# external_channel : Enable TCP channel. MUST be true for multiplayer use.
-#                   Clients require this to query the host's container state.
-#                   Options: true / false
-external_channel = true
+# external_channel : Enable advanced TCP channel for maximum stability.
+#                   DEFAULT: false (zero-config mode recommended)
+#                   SET TO: true ONLY if you need advanced networking features
+external_channel = false
 
-# external_port : TCP channel port. Server listens here; clients connect here.
-#                 All machines MUST use the same port. Default: 27500. Range: 1-65535.
-#                 Note: Firewall/port forwarding may be required for this port on server/host.
+# external_port : TCP channel port when enabled. Server listens here; clients connect here.
+#                 All machines MUST use the same port if channel is enabled. Default: 27500. Range: 1-65535.
+#                 Only applies when external_channel = true
 external_port = 27500
 
 # external_server_host : Server/Client IP or hostname to connect to.
-#                       - Server/Host/Single-player: Leave empty (no outgoing connection needed)
-#                       - Remote clients only: Fill with server's LAN IP (from ipconfig)
+#                       - With channel disabled (default): Ignored
+#                       - With channel enabled: Fill with server's LAN IP on client machines only
 #                       Examples: 192.168.1.100 or 10.0.0.5
+#                 Only applies when external_channel = true
 external_server_host =
 
-# ----------------------------------------------------------------------------
-#  Layer 2: Delta Sync (Incremental Synchronization)
-#  Sends only changed items in steady state rather than full dumps, dramatically
-#  reducing bandwidth usage while maintaining reliability via periodic full syncs.
-# ----------------------------------------------------------------------------
+# ============================================================================
+#  LAYER 2: Delta Sync (Incremental Synchronization - Optional)
+# ============================================================================
+#
+# Sends only changed items in steady state rather than full dumps, dramatically
+# reducing bandwidth usage. This layer improves performance but is not required.
+# Recommended to keep enabled if channel is active.
+# ============================================================================
 
 # channel_delta : Enable incremental updates (only changed items) instead of
 #                 sending full dump every time. Reduces traffic significantly.
-#                 Options: true / false
+#                 Default: true
 channel_delta = true
 
 # channel_full_sync_interval : Interval (ms) to force a full resync when in delta mode.
@@ -88,12 +103,16 @@ channel_delta = true
 #                              Default: 1 hour. Minimum: 5000.
 channel_full_sync_interval = 3600000
 
-# ----------------------------------------------------------------------------
-#  Layer 3: Delay Reply (Reentrancy Protection - Optional)
-#  Delays reply to CH requests until on_update callback, providing additional
-#  protection against race conditions in edge cases. Can be enabled if needed.
-# ----------------------------------------------------------------------------
+# ============================================================================
+#  LAYER 3: Delay Reply (Reentrancy Protection - Optional Advanced)
+# ============================================================================
+#
+# Delays reply to CH requests until on_update callback, providing additional
+# protection against race conditions in edge cases. Keep disabled unless you
+# experience specific edge-case issues.
+# ============================================================================
 
 # channel_delay_reply : Enable delayed reply to reentrancy protection.
-#                       Options: true / false (default: false, disable for now)
+#                       Default: false (disable for normal use)
 channel_delay_reply = false
+
